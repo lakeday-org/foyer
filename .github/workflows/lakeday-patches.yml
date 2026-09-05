@@ -22,6 +22,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.1
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy -p foyer-common -p foyer-storage -p foyer --all-targets -- -D warnings
