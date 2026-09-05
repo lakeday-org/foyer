@@ -90,7 +90,14 @@ where
     reclaimers: usize,
     buffer_pool_size: usize,
     blob_index_size: usize,
-    submit_queue_size_threshold: usize,
+    // VERGLAS PATCH: pre-existing bug fix (unrelated to live disk-resize). This was a bare `usize` hardcoded to
+    // 16 MiB in `new()`, contradicting its own doc comment ("Default: `buffer_pool_size` * 2") the moment a
+    // caller raised `buffer_pool_size` without also raising this: entries submitted past the stale 16 MiB
+    // threshold are silently dropped as ordinary backpressure (`BlockEngine::enqueue`'s
+    // `submit_queue_size > submit_queue_size_threshold` check), which reads exactly like "writes vanish after
+    // resize" if the caller happens to resize around the same time. `None` here means "derive from
+    // `buffer_pool_size` at build time," resolved in `build()`.
+    submit_queue_size_threshold: Option<usize>,
     clean_block_threshold: usize,
     eviction_pickers: Vec<Box<dyn EvictionPicker>>,
     admission_filter: StorageFilter,
@@ -146,9 +153,9 @@ where
             recover_concurrency: 8,
             flushers: 1,
             reclaimers: 1,
-            buffer_pool_size: 16 * 1024 * 1024,            // 16 MiB
-            blob_index_size: 4 * 1024,                     // 4 KiB
-            submit_queue_size_threshold: 16 * 1024 * 1024, // 16 MiB
+            buffer_pool_size: 16 * 1024 * 1024, // 16 MiB
+            blob_index_size: 4 * 1024,          // 4 KiB
+            submit_queue_size_threshold: None,  // derived from `buffer_pool_size * 2` at build time
             clean_block_threshold: 1,
             eviction_pickers: vec![Box::new(InvalidRatioPicker::new(0.8)), Box::<FifoPicker>::default()],
             admission_filter: StorageFilter::new(),
@@ -254,7 +261,7 @@ where
     ///
     /// Default: `buffer_pool_size` * 2.
     pub fn with_submit_queue_size_threshold(mut self, submit_queue_size_threshold: usize) -> Self {
-        self.submit_queue_size_threshold = submit_queue_size_threshold;
+        self.submit_queue_size_threshold = Some(submit_queue_size_threshold);
         self
     }
 
@@ -332,6 +339,10 @@ where
     ) -> Result<Arc<BlockEngine<K, V, P>>> {
         let device = self.device;
         let block_size = self.block_size;
+        // VERGLAS PATCH: pre-existing bug fix. Resolve the documented default here, at build time, against
+        // whatever `buffer_pool_size` the caller actually configured — not a value frozen in `new()` before the
+        // caller had a chance to override `buffer_pool_size`. See the field's doc comment on `BlockEngineConfig`.
+        let submit_queue_size_threshold = self.submit_queue_size_threshold.unwrap_or(self.buffer_pool_size * 2);
 
         let mut tombstones = vec![];
 
@@ -395,11 +406,17 @@ where
 
         let sequence = AtomicSequence::default();
 
+        // VERGLAS PATCH: a store reopened after a live shrink has fewer physically-backed blocks than its
+        // ceiling (`BlockManager::open` already classified the truncated tail as retired). Retired blocks are
+        // always the highest-id contiguous tail, so `0..active_blocks` is still the exact contiguous range the
+        // recover runner assumes; scanning the retired tail would read past the physically truncated file.
+        let active_blocks = blocks - block_manager.retired_count();
+
         RecoverRunner::run(
             self.recover_concurrency,
             recover_mode,
             self.blob_index_size,
-            (0..blocks as BlockId).collect_vec(),
+            (0..active_blocks as BlockId).collect_vec(),
             &sequence,
             &indexer,
             &block_manager,
@@ -410,7 +427,9 @@ where
         .await?;
 
         let io_buffer_size = self.buffer_pool_size / self.flushers;
-        for (flusher, rx) in flushers.iter().zip(rxs.into_iter()) {
+        // Pre-existing clippy fix (unrelated to live disk-resize): `.into_iter()` here is a no-op `zip` already
+        // accepts `IntoIterator`, and a newer clippy on this toolchain flags it as `useless_conversion`.
+        for (flusher, rx) in flushers.iter().zip(rxs) {
             flusher.run(
                 rx,
                 block_size,
@@ -432,11 +451,15 @@ where
         let inner = BlockEngineInner {
             admission_filter,
             device,
+            // VERGLAS PATCH: `resize_disk` needs both to convert a target byte count into a target block count
+            // and to clamp it to the minimum functional footprint.
+            block_size,
+            clean_block_threshold: self.clean_block_threshold,
             indexer,
             block_manager,
             flushers,
             submit_queue_size,
-            submit_queue_size_threshold: self.submit_queue_size_threshold,
+            submit_queue_size_threshold,
             sequence,
             _spawner: runtime,
             active: AtomicBool::new(true),
@@ -505,6 +528,9 @@ where
     admission_filter: StorageFilter,
 
     device: Arc<dyn Device>,
+    // VERGLAS PATCH: live disk-resize bookkeeping (see `resize_disk`).
+    block_size: usize,
+    clean_block_threshold: usize,
 
     indexer: Indexer,
     block_manager: BlockManager,
@@ -567,6 +593,61 @@ where
         .boxed()
     }
 
+    /// Resize the disk cache's active on-disk footprint.
+    ///
+    /// The store always opens at its ceiling capacity (`blocks * block_size`, from the configured device) and
+    /// never exceeds it: `target_bytes` is rounded down to a whole number of blocks and clamped between the
+    /// minimum functional footprint (`clean_block_threshold + 1` active blocks, so the engine can always make
+    /// forward progress) and the ceiling.
+    ///
+    /// Shrinking retires the tail blocks beyond the target (see [`BlockManager::retire_tail`]) and then
+    /// physically truncates the device. Growing physically extends the device first, then restores previously
+    /// retired blocks (see [`BlockManager::restore_retired`]) — extension must happen before the blocks are
+    /// handed back out, or a write could land past the (still-truncated) end of the file.
+    ///
+    /// Returns the resulting active capacity in bytes.
+    // VERGLAS PATCH: live disk-resize entry point. Block ids and their byte offsets never change; only how many
+    // of the ceiling's blocks are currently active does. See `BlockManager`'s `retired`/`pending_retire` state
+    // and `Device::set_physical_len` for the mechanics.
+    fn resize_disk(&self, target_bytes: u64) -> BoxFuture<'static, Result<u64>> {
+        let this = self.clone();
+        async move {
+            let block_size = this.inner.block_size as u64;
+            let total_blocks = this.inner.block_manager.blocks();
+            let min_active_blocks = (this.inner.clean_block_threshold + 1).min(total_blocks);
+
+            let target_blocks = ((target_bytes / block_size) as usize).clamp(min_active_blocks, total_blocks);
+            let active_blocks = total_blocks - this.inner.block_manager.retired_count();
+
+            match target_blocks.cmp(&active_blocks) {
+                std::cmp::Ordering::Less => {
+                    let shrink_by = active_blocks - target_blocks;
+                    // VERGLAS PATCH: each flusher may be holding a block open as its "current" block, writing to
+                    // it lazily as entries arrive; such a block never becomes evictable on its own (see
+                    // `Submission::Rotate`). Ask every flusher to release its current block before selecting
+                    // retirement candidates, or `retire_tail` could wait forever on a write that was never
+                    // actually going to happen absent new traffic.
+                    for flusher in &this.inner.flushers {
+                        flusher.rotate();
+                    }
+                    this.inner.block_manager.retire_tail(shrink_by).await;
+                    let new_len = target_blocks as u64 * block_size;
+                    this.inner.device.set_physical_len(new_len)?;
+                    Ok(new_len)
+                }
+                std::cmp::Ordering::Greater => {
+                    let grow_by = target_blocks - active_blocks;
+                    let new_len = target_blocks as u64 * block_size;
+                    this.inner.device.set_physical_len(new_len)?;
+                    this.inner.block_manager.restore_retired(grow_by);
+                    Ok(new_len)
+                }
+                std::cmp::Ordering::Equal => Ok(active_blocks as u64 * block_size),
+            }
+        }
+        .boxed()
+    }
+
     #[cfg_attr(feature = "tracing", trace(name = "foyer::storage::engine::block::generic::enqueue"))]
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) {
         if !self.inner.active.load(Ordering::Relaxed) {
@@ -583,12 +664,20 @@ where
             Age::Fresh | Age::Old => {}
             Age::Young => {
                 // skip write block engine if the entry is still young
+                tracing::debug!(hash = piece.hash(), "[block engine]: enqueue skipped, entry is young");
                 self.inner.metrics.storage_block_engine_enqueue_skip.increase(1);
                 return;
             }
         }
 
-        if self.inner.submit_queue_size.load(Ordering::Relaxed) > self.inner.submit_queue_size_threshold {
+        let submit_queue_size = self.inner.submit_queue_size.load(Ordering::Relaxed);
+        if submit_queue_size > self.inner.submit_queue_size_threshold {
+            tracing::debug!(
+                hash = piece.hash(),
+                submit_queue_size,
+                threshold = self.inner.submit_queue_size_threshold,
+                "[block engine]: enqueue skipped, submit queue overflow"
+            );
             self.inner.metrics.storage_queue_channel_overflow.increase(1);
             return;
         }
@@ -841,6 +930,10 @@ where
     fn close(&self) -> BoxFuture<'static, Result<()>> {
         self.close()
     }
+
+    fn resize_disk(&self, target_bytes: u64) -> BoxFuture<'static, Result<u64>> {
+        self.resize_disk(target_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -915,7 +1008,7 @@ mod tests {
             enable_tombstone_log: false,
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
-            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            submit_queue_size_threshold: Some(16 * 1024 * 1024 * 2),
             flush_switch: Switch::default(),
             load_holder: Holder::default(),
             marker: PhantomData,
@@ -958,7 +1051,7 @@ mod tests {
             enable_tombstone_log: true,
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
-            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            submit_queue_size_threshold: Some(16 * 1024 * 1024 * 2),
             flush_switch: Switch::default(),
             load_holder: Holder::default(),
             marker: PhantomData,
@@ -1401,5 +1494,324 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.inner.block_manager.blocks(), (1 + 2 + 4) * MB / (64 * KB));
+    }
+
+    // VERGLAS PATCH: `resize_disk` integration tests. These need a real single-file, sparse-file-backed device
+    // (`FileDeviceBuilder`) since `FsDeviceBuilder`, used by the other tests in this module, spreads partitions
+    // across one file per block and does not support `set_physical_len`.
+    mod resize {
+        use std::time::Duration;
+
+        use super::*;
+        use crate::io::device::file::FileDeviceBuilder;
+
+        /// 4 blocks, 16 KiB each, 64 KiB ceiling capacity.
+        const BLOCK_SIZE: usize = 16 * KB;
+        const BLOCKS: usize = 4;
+        const CAPACITY: usize = BLOCK_SIZE * BLOCKS;
+        /// Aligned to exactly one page-rounded blob part per block (16 KiB block - 4 KiB default blob index = 12
+        /// KiB usable; a 10 KiB value plus header aligns up to 12 KiB), so each of 4 entries submitted in a
+        /// single flush round lands in its own block, in id order.
+        const ENTRY_VALUE_SIZE: usize = 10 * KB;
+
+        async fn engine_for_resize_test(path: impl AsRef<Path>) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+            let device = FileDeviceBuilder::new(path).with_capacity(CAPACITY).build().unwrap();
+            let spawner = Spawner::current();
+            let io_engine = io_engine_for_test(spawner.clone()).await;
+            BlockEngineConfig::<u64, Vec<u8>, TestProperties>::new(device)
+                .with_block_size(BLOCK_SIZE)
+                // `clean_block_threshold: 0` disables the engine's default "always keep at least one clean
+                // block ready" background reclaim. With the default threshold of 1, that background reclaim
+                // fires the instant all 4 blocks hold data (picking the oldest, block 0) regardless of
+                // `resize_disk` — these tests need reclaim to happen only when they explicitly shrink.
+                .with_clean_block_threshold(0)
+                .boxed()
+                .build(EngineBuildContext {
+                    io_engine,
+                    metrics: Arc::new(Metrics::noop()),
+                    spawner,
+                    recover_mode: RecoverMode::Strict,
+                })
+                .await
+                .unwrap()
+        }
+
+        /// Insert `keys.len()` entries in a single flush round, so they land one per block, in ascending id order
+        /// starting from block 0 (see `ENTRY_VALUE_SIZE`).
+        async fn insert_one_per_block(
+            engine: &BlockEngine<u64, Vec<u8>, TestProperties>,
+            memory: &Cache<u64, Vec<u8>, ModHasher, TestProperties>,
+            keys: &[u64],
+        ) {
+            engine.hold_flush();
+            for &k in keys {
+                let entry = memory.insert(k, vec![k as u8; ENTRY_VALUE_SIZE]);
+                enqueue(engine, entry);
+            }
+            engine.unhold_flush();
+            engine.wait().await;
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_resize_disk_shrink_truncates_file_and_evicts_tail() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data");
+
+            let memory = cache_for_test();
+            let engine = engine_for_resize_test(&path).await;
+
+            insert_one_per_block(&engine, &memory, &[1, 2, 3, 4]).await;
+            for k in 1..=4u64 {
+                assert_eq!(
+                    engine.load(memory.hash(&k)).await.unwrap().kv().unwrap(),
+                    (k, vec![k as u8; ENTRY_VALUE_SIZE])
+                );
+            }
+            assert_eq!(engine.inner.block_manager.retired_count(), 0);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), CAPACITY as u64);
+
+            // Shrink to 2 blocks: retires the tail (blocks 2 and 3, holding entries 3 and 4).
+            let active = engine.resize_disk((2 * BLOCK_SIZE) as u64).await.unwrap();
+            assert_eq!(active, (2 * BLOCK_SIZE) as u64);
+            assert_eq!(engine.inner.block_manager.retired_count(), 2);
+
+            // The backing file is physically truncated, not just logically shrunk.
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), (2 * BLOCK_SIZE) as u64);
+
+            // Entries that lived in the retired tail now miss.
+            assert!(engine.load(memory.hash(&3)).await.unwrap().is_miss());
+            assert!(engine.load(memory.hash(&4)).await.unwrap().is_miss());
+
+            // Entries that survived in the still-active blocks still hit.
+            assert_eq!(
+                engine.load(memory.hash(&1)).await.unwrap().kv().unwrap(),
+                (1, vec![1u8; ENTRY_VALUE_SIZE])
+            );
+            assert_eq!(
+                engine.load(memory.hash(&2)).await.unwrap().kv().unwrap(),
+                (2, vec![2u8; ENTRY_VALUE_SIZE])
+            );
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_resize_disk_grow_back_restores_write_capacity() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data");
+
+            let memory = cache_for_test();
+            let engine = engine_for_resize_test(&path).await;
+
+            insert_one_per_block(&engine, &memory, &[1, 2, 3, 4]).await;
+            engine.resize_disk((2 * BLOCK_SIZE) as u64).await.unwrap();
+            assert_eq!(engine.inner.block_manager.retired_count(), 2);
+
+            // Grow back to the full ceiling: restores the 2 retired blocks to clean.
+            let active = engine.resize_disk(CAPACITY as u64).await.unwrap();
+            assert_eq!(active, CAPACITY as u64);
+            assert_eq!(engine.inner.block_manager.retired_count(), 0);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), CAPACITY as u64);
+
+            // A new entry lands in a restored block: it is retrievable, and doing so did not require evicting the
+            // entries that survived the shrink (proving the grow added real capacity, not just triggered reclaim).
+            insert_one_per_block(&engine, &memory, &[5]).await;
+            assert_eq!(
+                engine.load(memory.hash(&5)).await.unwrap().kv().unwrap(),
+                (5, vec![5u8; ENTRY_VALUE_SIZE])
+            );
+            assert_eq!(
+                engine.load(memory.hash(&1)).await.unwrap().kv().unwrap(),
+                (1, vec![1u8; ENTRY_VALUE_SIZE])
+            );
+            assert_eq!(
+                engine.load(memory.hash(&2)).await.unwrap().kv().unwrap(),
+                (2, vec![2u8; ENTRY_VALUE_SIZE])
+            );
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_resize_disk_shrink_with_writes_in_flight_does_not_deadlock() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data");
+
+            let memory = cache_for_test();
+            // Unlike `engine_for_resize_test`, this test keeps the engine's default `clean_block_threshold: 1`:
+            // the shrink below is going to retire blocks a queued write still needs, so this test specifically
+            // needs the engine's normal self-healing background reclaim (of the surviving evictable blocks) to
+            // free up a clean block again — with `clean_block_threshold: 0` that reclaim never fires and the
+            // queued write would wait forever, which is a pre-existing gap in this store's design (reclaim is
+            // only ever triggered by consuming a clean block or finishing a write/reclaim), not a live
+            // disk-resize deadlock.
+            let device = FileDeviceBuilder::new(&path).with_capacity(CAPACITY).build().unwrap();
+            let spawner = Spawner::current();
+            let io_engine = io_engine_for_test(spawner.clone()).await;
+            let engine = BlockEngineConfig::<u64, Vec<u8>, TestProperties>::new(device)
+                .with_block_size(BLOCK_SIZE)
+                .boxed()
+                .build(EngineBuildContext {
+                    io_engine,
+                    metrics: Arc::new(Metrics::noop()),
+                    spawner,
+                    recover_mode: RecoverMode::Strict,
+                })
+                .await
+                .unwrap();
+
+            insert_one_per_block(&engine, &memory, &[1, 2]).await;
+
+            // Hold the flusher so entries 3..6 stay queued (write pressure exceeding the 2 remaining clean
+            // blocks) while a concurrent shrink retires the tail those queued writes would otherwise use.
+            engine.hold_flush();
+            for k in 3..=6u64 {
+                let entry = memory.insert(k, vec![k as u8; ENTRY_VALUE_SIZE]);
+                enqueue(&engine, entry);
+            }
+
+            let resize_engine = engine.clone();
+            let resize = tokio::spawn(async move { resize_engine.resize_disk((2 * BLOCK_SIZE) as u64).await });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            engine.unhold_flush();
+
+            let active = tokio::time::timeout(Duration::from_secs(5), resize)
+                .await
+                .expect("resize_disk must not deadlock while writes are queued against the retired tail")
+                .unwrap()
+                .unwrap();
+            assert_eq!(active, (2 * BLOCK_SIZE) as u64);
+
+            // The queued writes must also eventually drain (via the engine's own reclaim of the surviving
+            // blocks), proving the shrink did not leave the flusher permanently stuck either.
+            tokio::time::timeout(Duration::from_secs(5), engine.wait())
+                .await
+                .expect("queued writes must not deadlock after a concurrent shrink");
+
+            // The engine is still fully functional after the contention: a fresh insert lands and is retrievable.
+            insert_one_per_block(&engine, &memory, &[99]).await;
+            assert_eq!(
+                engine.load(memory.hash(&99)).await.unwrap().kv().unwrap(),
+                (99, vec![99u8; ENTRY_VALUE_SIZE])
+            );
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_resize_disk_reopen_after_shrink_recovers() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data");
+
+            let memory = cache_for_test();
+            let engine = engine_for_resize_test(&path).await;
+            insert_one_per_block(&engine, &memory, &[1, 2, 3, 4]).await;
+            engine.resize_disk((2 * BLOCK_SIZE) as u64).await.unwrap();
+            engine.close().await.unwrap();
+            drop(engine);
+
+            // Reopen at the same ceiling capacity. `RecoverMode::Strict` panics on any recovery error, so a
+            // successful build already proves the retired tail was not scanned (the file is physically shorter
+            // than the ceiling; scanning past its end would fail).
+            let reopened = engine_for_resize_test(&path).await;
+
+            assert_eq!(reopened.inner.block_manager.blocks(), BLOCKS);
+            assert_eq!(reopened.inner.block_manager.retired_count(), 2);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), (2 * BLOCK_SIZE) as u64);
+
+            assert_eq!(
+                reopened.load(memory.hash(&1)).await.unwrap().kv().unwrap(),
+                (1, vec![1u8; ENTRY_VALUE_SIZE])
+            );
+            assert_eq!(
+                reopened.load(memory.hash(&2)).await.unwrap().kv().unwrap(),
+                (2, vec![2u8; ENTRY_VALUE_SIZE])
+            );
+        }
+
+        /// Same engine shape as `engine_for_resize_test`, but with the engine's *default* `clean_block_threshold`
+        /// (1, not 0), so `resize_disk`'s functional floor is 2 active blocks — matching the downstream repro
+        /// ("resize_disk down until ~2 blocks active") instead of the artificially deterministic 1-block floor
+        /// the other tests in this module use.
+        async fn engine_for_floor_test(
+            path: impl AsRef<Path>,
+            blocks: usize,
+        ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+            let capacity = BLOCK_SIZE * blocks;
+            let device = FileDeviceBuilder::new(path).with_capacity(capacity).build().unwrap();
+            let spawner = Spawner::current();
+            let io_engine = io_engine_for_test(spawner.clone()).await;
+            BlockEngineConfig::<u64, Vec<u8>, TestProperties>::new(device)
+                .with_block_size(BLOCK_SIZE)
+                .boxed()
+                .build(EngineBuildContext {
+                    io_engine,
+                    metrics: Arc::new(Metrics::noop()),
+                    spawner,
+                    recover_mode: RecoverMode::Strict,
+                })
+                .await
+                .unwrap()
+        }
+
+        // VERGLAS PATCH: regression test for a defect the downstream acceptance test caught — after a shrink to
+        // the functional floor (which forces the flusher's dangling current block closed via
+        // `Submission::Rotate`) followed by a grow back to the ceiling, further inserts silently never reached
+        // disk. `engine.load()` would still miss for them even after `engine.wait()` returned successfully,
+        // because the write never actually landed: nothing had reported it as failed, it had simply been dropped
+        // by the flusher's post-rotate handle re-acquisition (see `Runner::current_block_handle` in flusher.rs).
+        #[test_log::test(tokio::test)]
+        async fn test_resize_disk_insert_after_floor_shrink_and_grow_back_lands_on_disk() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data");
+
+            const FLOOR_BLOCKS: usize = 8;
+            const FLOOR_CAPACITY: usize = BLOCK_SIZE * FLOOR_BLOCKS;
+
+            let engine = engine_for_floor_test(&path, FLOOR_BLOCKS).await;
+            let memory = cache_for_test();
+
+            // Fill all 8 blocks (one entry per block; the last stays the flusher's dangling "current"). With the
+            // default `clean_block_threshold` (1) this can also trigger opportunistic background reclaim mid-fill
+            // — which entries end up surviving the fill isn't the point here, so nothing is asserted about it.
+            insert_one_per_block(&engine, &memory, &[1, 2, 3, 4, 5, 6, 7, 8]).await;
+
+            // Shrink to the functional floor: `target_bytes = 0` clamps up to the minimum active footprint
+            // (`clean_block_threshold + 1` = 2 blocks here, matching the downstream repro's "~2 blocks active").
+            // Whichever block the flusher is currently holding open as "current" is necessarily retired by this,
+            // forcing a `Submission::Rotate`.
+            let floor = engine.resize_disk(0).await.unwrap();
+            assert_eq!(floor, (2 * BLOCK_SIZE) as u64);
+
+            // Grow back to the full ceiling: restores the retired blocks to clean.
+            let active = engine.resize_disk(FLOOR_CAPACITY as u64).await.unwrap();
+            assert_eq!(active, FLOOR_CAPACITY as u64);
+            assert_eq!(engine.inner.block_manager.retired_count(), 0);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), FLOOR_CAPACITY as u64);
+
+            // Insert 4 more entries and flush. This is the regression: these writes must actually reach disk,
+            // not just appear to succeed.
+            insert_one_per_block(&engine, &memory, &[9, 10, 11, 12]).await;
+
+            for k in 9..=12u64 {
+                let loaded = tokio::time::timeout(Duration::from_secs(5), engine.load(memory.hash(&k)))
+                    .await
+                    .expect("load must not hang")
+                    .unwrap();
+                assert_eq!(
+                    loaded.kv(),
+                    Some((k, vec![k as u8; ENTRY_VALUE_SIZE])),
+                    "entry {k} inserted after floor shrink + grow-back did not land on disk"
+                );
+            }
+
+            // Confirm disk residency independent of the indexer too: close and reopen, and the new entries must
+            // still be there (a purely in-memory or dropped write would not survive this).
+            engine.close().await.unwrap();
+            drop(engine);
+            let reopened = engine_for_floor_test(&path, FLOOR_BLOCKS).await;
+            for k in 9..=12u64 {
+                assert_eq!(
+                    reopened.load(memory.hash(&k)).await.unwrap().kv(),
+                    Some((k, vec![k as u8; ENTRY_VALUE_SIZE])),
+                    "entry {k} did not survive reopen: it was never durably written"
+                );
+            }
+        }
     }
 }

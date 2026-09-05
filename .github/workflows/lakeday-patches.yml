@@ -1,0 +1,29 @@
+name: Lakeday patches
+
+on:
+  pull_request:
+    branches: ["release/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lakeday-patches-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.repository == 'lakeday-org/foyer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p foyer-common -p foyer-storage -p foyer --all-targets -- -D warnings
+      - run: cargo test -p foyer-common -p foyer-storage -p foyer --lib

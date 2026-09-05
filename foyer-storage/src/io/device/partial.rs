@@ -100,6 +100,13 @@ impl Device for PartialDevice {
     fn statistics(&self) -> &Arc<Statistics> {
         self.inner.statistics()
     }
+
+    // VERGLAS PATCH: a partial device is a capacity-limited view over a shared inner device that other partial
+    // devices may also be slicing; resizing the shared inner device's physical extent from one view would
+    // silently affect the others. No silent fallback: refuse explicitly.
+    fn set_physical_len(&self, _bytes: u64) -> Result<()> {
+        Err(Error::unsupported("set_physical_len", "PartialDevice"))
+    }
 }
 
 #[derive(Debug)]

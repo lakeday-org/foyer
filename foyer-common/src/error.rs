@@ -53,6 +53,12 @@ pub enum ErrorKind {
     Closed,
     /// Recover error.
     Recover,
+    /// Operation not supported by this implementation.
+    // VERGLAS PATCH: distinguishes "this device/component does not implement the requested operation" from a
+    // config mistake (`Config`) or a transient failure (`Io`/`External`), so callers can match on it instead of
+    // parsing a message string. Introduced for `Device::set_physical_len` on devices that cannot live-resize
+    // (fs, combined, partial).
+    Unsupported,
 }
 
 impl ErrorKind {
@@ -85,6 +91,7 @@ impl From<ErrorKind> for &'static str {
             ErrorKind::NoSpace => "No space",
             ErrorKind::Closed => "Closed",
             ErrorKind::Recover => "Recover error",
+            ErrorKind::Unsupported => "Unsupported operation",
         }
     }
 }
@@ -367,6 +374,16 @@ impl Error {
             .with_context("capacity", capacity)
             .with_context("allocated", allocated)
             .with_context("required", required)
+    }
+
+    /// Helper for creating a [`ErrorKind::Unsupported`] error naming the operation and the component that
+    /// cannot perform it.
+    // VERGLAS PATCH: shared constructor so every "no silent fallback" unsupported-operation error looks the
+    // same, instead of each call site hand-rolling its own message.
+    pub fn unsupported(operation: &'static str, component: &'static str) -> Self {
+        Error::new(ErrorKind::Unsupported, "operation not supported")
+            .with_context("operation", operation)
+            .with_context("component", component)
     }
 }
 

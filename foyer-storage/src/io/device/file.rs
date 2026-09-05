@@ -108,7 +108,13 @@ impl DeviceBuilder for FileDeviceBuilder {
                 "Please use `DirectFileDevice` directly on a raw block device.",
                 "Or use `DirectFsDevice` within a normal file system.",
             );
-            file.set_len(capacity as _).map_err(Error::io_error)?;
+            // VERGLAS PATCH: only initialize a freshly created (empty) file to the full ceiling capacity. A
+            // file that already has a nonzero length is a reopen of a store that may have been shrunk with
+            // `set_physical_len` in a previous session; unconditionally resetting it to `capacity` here would
+            // silently undo that shrink every time the store reopens, defeating live-resize persistence.
+            if file.metadata().map_err(Error::io_error)?.len() == 0 {
+                file.set_len(capacity as _).map_err(Error::io_error)?;
+            }
         }
         let file = Arc::new(file);
 
@@ -172,6 +178,17 @@ impl Device for FileDevice {
 
     fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
+    }
+
+    // VERGLAS PATCH: live disk-resize support. The single backing file is sparse, so both directions are cheap:
+    // growing only updates metadata (no bytes are written), and shrinking truncates away the tail unconditionally
+    // (the caller is responsible for having already retired/evacuated the blocks that lived there).
+    fn physical_len(&self) -> Result<u64> {
+        self.file.metadata().map(|m| m.len()).map_err(Error::io_error)
+    }
+
+    fn set_physical_len(&self, bytes: u64) -> Result<()> {
+        self.file.set_len(bytes).map_err(Error::io_error)
     }
 }
 

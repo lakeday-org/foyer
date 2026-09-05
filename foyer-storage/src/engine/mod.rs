@@ -192,6 +192,15 @@ where
     ///
     /// `close` will wait for all ongoing flush and reclaim tasks to finish.
     fn close(&self) -> BoxFuture<'static, Result<()>>;
+
+    /// Resize the disk cache engine's active on-disk footprint to `target_bytes`, rounded and clamped to
+    /// whatever granularity the engine's storage layout allows. Returns the resulting active capacity in bytes.
+    ///
+    /// An engine never grows past the ceiling capacity it opened with.
+    // VERGLAS PATCH: live disk-resize. Added to the engine trait (rather than only the block engine) so
+    // `Store`/`HybridCache` have a single, engine-agnostic entry point; `NoopEngine` implements it as a trivial
+    // no-op since it has no real backing storage.
+    fn resize_disk(&self, target_bytes: u64) -> BoxFuture<'static, Result<u64>>;
 }
 
 pub mod block;

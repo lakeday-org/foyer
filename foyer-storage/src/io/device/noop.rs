@@ -92,6 +92,11 @@ impl Device for NoopDevice {
     fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
     }
+
+    // VERGLAS PATCH: the no-op device has no real backing storage, so resizing it is always a trivial success.
+    fn set_physical_len(&self, _bytes: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

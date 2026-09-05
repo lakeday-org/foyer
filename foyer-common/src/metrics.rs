@@ -67,6 +67,8 @@ pub struct Metrics {
     pub storage_block_engine_block_writing: BoxedGauge,
     pub storage_block_engine_block_evictable: BoxedGauge,
     pub storage_block_engine_block_reclaiming: BoxedGauge,
+    // VERGLAS PATCH: tracks blocks retired by a live disk-resize shrink, mirroring the other block state gauges.
+    pub storage_block_engine_block_retired: BoxedGauge,
 
     pub storage_block_engine_block_size_bytes: BoxedGauge,
 
@@ -264,6 +266,8 @@ impl Metrics {
             foyer_storage_block_engine_block.gauge(&[name.clone(), "evictable".into()]);
         let storage_block_engine_block_reclaiming =
             foyer_storage_block_engine_block.gauge(&[name.clone(), "reclaiming".into()]);
+        let storage_block_engine_block_retired =
+            foyer_storage_block_engine_block.gauge(&[name.clone(), "retired".into()]);
 
         let storage_block_engine_block_size_bytes =
             foyer_storage_block_engine_block_size_bytes.gauge(std::slice::from_ref(&name));
@@ -350,6 +354,7 @@ impl Metrics {
             storage_block_engine_block_writing,
             storage_block_engine_block_evictable,
             storage_block_engine_block_reclaiming,
+            storage_block_engine_block_retired,
             storage_block_engine_block_size_bytes,
             storage_entry_serialize_duration,
             storage_entry_deserialize_duration,

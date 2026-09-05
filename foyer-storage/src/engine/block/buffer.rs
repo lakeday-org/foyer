@@ -320,7 +320,29 @@ impl SplitCtx {
 pub struct Splitter;
 
 impl Splitter {
-    pub fn split(ctx: &mut SplitCtx, mut bytes: IoSlice, entry_infos: Vec<BufferEntryInfo>) -> Batch {
+    pub fn split(ctx: &mut SplitCtx, bytes: IoSlice, entry_infos: Vec<BufferEntryInfo>) -> Batch {
+        Self::split_inner(ctx, bytes, entry_infos, false)
+    }
+
+    /// Same as [`Self::split`], but additionally forces the current (last) block closed at the end, even if this
+    /// round wrote nothing new to it.
+    ///
+    /// Normally a block only closes (becomes eligible for `BlockManager::on_writing_finish`) when new data
+    /// overflows it into a fresh block; a block nobody is writing more into otherwise stays the flusher's
+    /// "current" block indefinitely, which a live disk-resize shrink can never wait out. This lets a shrink
+    /// force that release: the (possibly empty) current block is sealed and handed off, and a fresh block
+    /// becomes the new current.
+    // VERGLAS PATCH: see `Submission::Rotate` / `Flusher::rotate` for the caller that needs this.
+    pub fn split_and_close(ctx: &mut SplitCtx, bytes: IoSlice, entry_infos: Vec<BufferEntryInfo>) -> Batch {
+        Self::split_inner(ctx, bytes, entry_infos, true)
+    }
+
+    fn split_inner(
+        ctx: &mut SplitCtx,
+        mut bytes: IoSlice,
+        entry_infos: Vec<BufferEntryInfo>,
+        force_close: bool,
+    ) -> Batch {
         let mut batch = Batch {
             blocks: vec![Block { blob_parts: vec![] }],
             bytes: bytes.clone(),
@@ -374,7 +396,20 @@ impl Splitter {
             }
         }
 
-        if let Some(part) = Self::seal_blob(ctx, &mut indices, &mut part_size, &mut bytes) {
+        if force_close {
+            // Use `split_blob` (not `seal_blob`): unlike `seal_blob`, it resets `current_part_blob_offset` and
+            // `current_blob_index` even when there is nothing to seal (`indices` empty) — exactly the state a
+            // fresh, not-yet-chosen next block needs. Unlike the mid-loop overflow case, do NOT call
+            // `split_block`/append a synthetic trailing `Block`: that would force the caller to reserve a new
+            // block (a `BlockManager::get_clean_block()` call) for it immediately, which can deadlock if the
+            // caller has no spare clean block right now (e.g. mid-shrink). The caller is expected to leave its
+            // current block reservation empty and only fetch a fresh one lazily, the next time it actually has
+            // new data to write — see `Flusher`'s handling of `Submission::Rotate`.
+            if let Some(part) = Self::split_blob(ctx, &mut indices, &mut part_size, &mut bytes) {
+                batch.blocks.last_mut().unwrap().blob_parts.push(part);
+            }
+            ctx.current_blob_block_offset = 0;
+        } else if let Some(part) = Self::seal_blob(ctx, &mut indices, &mut part_size, &mut bytes) {
             batch.blocks.last_mut().unwrap().blob_parts.push(part);
         }
 
