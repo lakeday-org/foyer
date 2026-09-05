@@ -175,6 +175,13 @@ impl Device for FsDevice {
     fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
     }
+
+    // VERGLAS PATCH: this device spreads partitions across one file per partition; there is no single backing
+    // extent to resize, so shrinking it would require deciding which partition files to truncate or remove. No
+    // silent fallback: refuse explicitly rather than guess.
+    fn set_physical_len(&self, _bytes: u64) -> Result<()> {
+        Err(Error::unsupported("set_physical_len", "FsDevice"))
+    }
 }
 
 #[derive(Debug)]

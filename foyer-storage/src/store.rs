@@ -31,7 +31,11 @@ use foyer_common::{
 };
 use foyer_memory::{Cache, Piece};
 
-#[cfg(feature = "test_utils")]
+// Pre-existing bug fix (unrelated to live disk-resize): this import was gated on `feature = "test_utils"` only,
+// but `StoreInner::load_throttle_switch` below is gated on `cfg(any(test, feature = "test_utils"))`, so a plain
+// `cargo test` (no `--features test_utils`) failed to compile this file at all with "cannot find type
+// `LoadThrottleSwitch`". Match the gate to the field it serves.
+#[cfg(any(test, feature = "test_utils"))]
 use crate::test_utils::*;
 use crate::{
     compress::Compression,
@@ -126,6 +130,15 @@ where
         self.inner.engine.close().await
     }
 
+    /// Resize the disk cache's active on-disk footprint to `target_bytes`, rounded and clamped to the engine's
+    /// storage layout. Returns the resulting active capacity in bytes.
+    ///
+    /// The disk cache never grows past the ceiling capacity it opened with.
+    // VERGLAS PATCH: live disk-resize surface, forwarding to the underlying engine.
+    pub async fn resize_disk(&self, target_bytes: u64) -> Result<u64> {
+        self.inner.engine.resize_disk(target_bytes).await
+    }
+
     /// Return if the given key can be picked by the admission filter.
     pub fn filter(&self, hash: u64, estimated_size: usize) -> StorageFilterResult {
         self.inner.engine.filter(hash, estimated_size)
@@ -136,14 +149,21 @@ where
         tracing::trace!(hash = piece.hash(), "[store]: enqueue piece");
         let now = Instant::now();
 
-        if force
-            || self
-                .filter(
-                    piece.hash(),
-                    piece.key().estimated_size() + piece.value().estimated_size(),
-                )
-                .is_admitted()
-        {
+        let filter_result = self.filter(
+            piece.hash(),
+            piece.key().estimated_size() + piece.value().estimated_size(),
+        );
+        if !force && !filter_result.is_admitted() {
+            // VERGLAS PATCH: a fourth silent-drop path, upstream of the flusher entirely: the admission filter
+            // (which may include `IoThrottle`, or a caller-supplied condition) rejected or throttled the entry,
+            // so it never reaches `engine.enqueue` at all.
+            tracing::debug!(
+                hash = piece.hash(),
+                ?filter_result,
+                "[store]: enqueue not admitted, dropping piece"
+            );
+        }
+        if force || filter_result.is_admitted() {
             let estimated_size = EntrySerializer::estimated_size(piece.key(), piece.value());
             let rpiece = self.inner.keeper.insert(piece);
             self.inner.engine.enqueue(rpiece, estimated_size);

@@ -625,6 +625,16 @@ where
         self.inner.close().await
     }
 
+    /// Resize the hybrid cache's active on-disk footprint to `target_bytes`, rounded and clamped to the disk
+    /// cache engine's storage layout. Returns the resulting active capacity in bytes.
+    ///
+    /// The disk cache never grows past the ceiling capacity it opened with. Has no effect (returns `0`) when the
+    /// hybrid cache is not running in real hybrid mode (see [`Self::is_hybrid`]).
+    // VERGLAS PATCH: live disk-resize surface, forwarding to the underlying disk cache store.
+    pub async fn resize_disk(&self, target_bytes: u64) -> Result<u64> {
+        self.inner.storage.resize_disk(target_bytes).await
+    }
+
     /// Return the statistics information of the hybrid cache.
     pub fn statistics(&self) -> &Arc<Statistics> {
         self.inner.storage.statistics()
@@ -1605,5 +1615,171 @@ mod tests {
 
         let eref = err.downcast_ref::<TestError>();
         assert_eq!(eref, Some(&e));
+    }
+
+    // VERGLAS PATCH: hybrid-cache-level regression test for a defect the downstream acceptance test caught —
+    // after `resize_disk` shrinks the disk store to its functional floor (forcing the flusher's dangling current
+    // block closed via `Submission::Rotate`) and then grows it back to the ceiling, further evictions from memory
+    // silently never reached disk. A hybrid-cache-level `get()` after this would still return the right value —
+    // served from the memory tier — masking the failure; the only way to see it is to evict memory and check
+    // disk residency directly, exactly as this test does.
+    #[test_log::test(tokio::test)]
+    async fn test_resize_disk_floor_shrink_then_grow_back_insert_lands_on_disk() {
+        const BLOCK_SIZE: usize = 16 * KB;
+        const BLOCKS: usize = 8;
+        const CAPACITY: usize = BLOCK_SIZE * BLOCKS;
+        const ENTRY_VALUE_SIZE: usize = 10 * KB;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let block_engine_builder = BlockEngineConfig::new(
+            FileDeviceBuilder::new(dir.path().join("data"))
+                .with_capacity(CAPACITY)
+                .build()
+                .unwrap(),
+        )
+        .with_block_size(BLOCK_SIZE);
+
+        let hybrid: HybridCache<u64, Vec<u8>, ModHasher> = HybridCacheBuilder::new()
+            .with_name("floor-shrink-then-grow")
+            .memory(64 * MB)
+            .with_hash_builder(ModHasher::default())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(block_engine_builder)
+            .build()
+            .await
+            .unwrap();
+
+        // Fill all 8 blocks. Default policy is `WriteOnEviction`, so entries live in memory only until evicted;
+        // `evict_all` is what actually dispatches them to the disk engine.
+        for k in 1..=8u64 {
+            hybrid.insert(k, vec![k as u8; ENTRY_VALUE_SIZE]);
+        }
+        hybrid.memory().evict_all();
+        hybrid.storage().wait().await;
+
+        // Shrink to the functional floor (`target_bytes = 0` clamps up to `clean_block_threshold + 1`, the
+        // default's 2 active blocks — matching the downstream repro's "~2 blocks active"). Whichever block the
+        // flusher was holding open as "current" is necessarily among the retired blocks, forcing a
+        // `Submission::Rotate`.
+        hybrid.storage().resize_disk(0).await.unwrap();
+
+        // Grow back to the full ceiling.
+        let active = hybrid.storage().resize_disk(CAPACITY as u64).await.unwrap();
+        assert_eq!(active, CAPACITY as u64);
+
+        // Insert 4 more entries and evict them to disk. This is the regression: these writes must actually reach
+        // disk, not just live in memory forever because the flusher's post-rotate replacement block was never
+        // (or never successfully) re-acquired.
+        for k in 9..=12u64 {
+            hybrid.insert(k, vec![k as u8; ENTRY_VALUE_SIZE]);
+        }
+        hybrid.memory().evict_all();
+        hybrid.storage().wait().await;
+
+        // Check disk residency directly: memory is empty at this point (just evicted), so `storage().load()`
+        // (unlike `hybrid.get()`) cannot be served from memory. A dropped write shows up here as a miss.
+        for k in 9..=12u64 {
+            let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), hybrid.storage().load(&k))
+                .await
+                .expect("storage load must not hang")
+                .unwrap();
+            assert_eq!(
+                loaded.entry().map(|(_, v, _)| v),
+                Some(vec![k as u8; ENTRY_VALUE_SIZE]),
+                "entry {k} inserted after floor shrink + grow-back did not land on disk"
+            );
+        }
+    }
+
+    // VERGLAS PATCH: investigates the same regression as
+    // `test_resize_disk_floor_shrink_then_grow_back_insert_lands_on_disk`, matched to the downstream repro's exact
+    // scale (8 x 8 MiB blocks). This does NOT reproduce a resize defect — see the extensive investigation notes
+    // below — but it pins down the actual root cause of the downstream symptom and doubles as a regression test
+    // for the fix: `BlockEngineConfig::submit_queue_size_threshold` used to default to a hardcoded 16 MiB
+    // regardless of `buffer_pool_size`, contradicting its own doc comment ("Default: `buffer_pool_size` * 2").
+    // `BlockEngine::enqueue` silently drops entries submitted while over that threshold as ordinary backpressure
+    // (`submit_queue_size > submit_queue_size_threshold`) — with `buffer_pool_size` raised to fit 8 MiB entries but
+    // the threshold stuck at the old 16 MiB default, most entries in a tight, unyielding insert loop got dropped
+    // this way before the flusher was ever scheduled to drain its queue. That reproduced this exact symptom
+    // ("insert appears to succeed, never reaches disk") with the two `resize_disk` calls removed and no other
+    // change, and stopped reproducing once the threshold was raised to match `buffer_pool_size` (now fixed at the
+    // default, in `BlockEngineConfig::build`, in `foyer-storage/src/engine/block/engine.rs`) — a state-machine
+    // defect in `resize_disk` would not have cared about either of those axes. Uses `WriteOnInsertion` and an
+    // explicit `wait()` after the fill (rather than `WriteOnEviction` + `evict_all()`) to make the fill's actual
+    // disk landing deterministic before shrinking, matching the downstream repro's implied ordering.
+    #[test_log::test(tokio::test)]
+    async fn test_resize_disk_floor_shrink_then_grow_back_insert_lands_on_disk_at_scale() {
+        const BLOCK_SIZE: usize = 8 * MB;
+        const BLOCKS: usize = 8;
+        const CAPACITY: usize = BLOCK_SIZE * BLOCKS;
+        const ENTRY_VALUE_SIZE: usize = 7 * MB;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let block_engine_builder = BlockEngineConfig::new(
+            FileDeviceBuilder::new(dir.path().join("data"))
+                .with_capacity(CAPACITY)
+                .build()
+                .unwrap(),
+        )
+        .with_block_size(BLOCK_SIZE)
+        // Large enough to hold every entry this test ever submits in one shot. `submit_queue_size_threshold` is
+        // intentionally left at its (now-fixed) default of `buffer_pool_size * 2` rather than set explicitly, so
+        // this test also exercises that default.
+        .with_buffer_pool_size(CAPACITY);
+
+        let hybrid: HybridCache<u64, Vec<u8>, ModHasher> = HybridCacheBuilder::new()
+            .with_name("floor-shrink-then-grow-at-scale")
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .memory(2 * CAPACITY)
+            .with_hash_builder(ModHasher::default())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(block_engine_builder)
+            .build()
+            .await
+            .unwrap();
+
+        // Fill all 8 blocks and wait for the writes to actually land, so the shrink below retires blocks that
+        // hold real data (forcing a `Submission::Rotate` for whichever one is the flusher's dangling current),
+        // not just clean, never-touched ones.
+        for k in 1..=8u64 {
+            hybrid.insert(k, vec![k as u8; ENTRY_VALUE_SIZE]);
+        }
+        hybrid.storage().wait().await;
+
+        // Shrink to the functional floor (2 active blocks with the default `clean_block_threshold`), then grow
+        // back to the full ceiling. This discards entries 1-8's data outside the 2 surviving blocks (by design:
+        // the default reinsertion filter rejects everything), freeing up 6 blocks' worth of real capacity.
+        hybrid.storage().resize_disk(0).await.unwrap();
+        let active = hybrid.storage().resize_disk(CAPACITY as u64).await.unwrap();
+        assert_eq!(active, CAPACITY as u64);
+
+        // Insert 4 more entries — there is now plenty of free capacity for them without evicting anything else —
+        // and wait for them to land. This is the regression: they must actually reach disk.
+        for k in 9..=12u64 {
+            hybrid.insert(k, vec![k as u8; ENTRY_VALUE_SIZE]);
+        }
+        hybrid.storage().wait().await;
+
+        // Check disk residency directly, bypassing the memory tier, so a write that silently never reached disk
+        // (but still "succeeded" as far as the caller of `insert` could tell) shows up as a miss here.
+        hybrid.memory().evict_all();
+        for k in 9..=12u64 {
+            let loaded = tokio::time::timeout(std::time::Duration::from_secs(30), hybrid.storage().load(&k))
+                .await
+                .expect("storage load must not hang")
+                .unwrap();
+            // Summarize instead of comparing the full multi-MiB `Vec<u8>` directly: an assertion failure would
+            // otherwise dump the entire (multi-megabyte) expected/actual vector to the test log.
+            let got = loaded.entry().map(|(_, v, _)| (v.len(), v.first().copied()));
+            assert_eq!(
+                got,
+                Some((ENTRY_VALUE_SIZE, Some(k as u8))),
+                "entry {k} inserted after floor shrink + grow-back did not land on disk"
+            );
+        }
     }
 }

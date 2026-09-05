@@ -61,7 +61,8 @@ bytesize = { workspace = true }
 foyer-memory = { workspace = true, features = ["test_utils"] }
 tempfile = { workspace = true }
 test-log = { workspace = true, features = ["trace", "color"] }
-tokio = { workspace = true }
+# VERGLAS PATCH: `time` is needed by the live disk-resize tests (bounded `timeout`s asserting no deadlock).
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

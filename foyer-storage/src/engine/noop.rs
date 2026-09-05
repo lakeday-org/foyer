@@ -152,4 +152,9 @@ where
     fn close(&self) -> BoxFuture<'static, Result<()>> {
         async move { Ok(()) }.boxed()
     }
+
+    // VERGLAS PATCH: the no-op engine has no real backing storage to resize; it always reports zero capacity.
+    fn resize_disk(&self, _target_bytes: u64) -> BoxFuture<'static, Result<u64>> {
+        async move { Ok(0) }.boxed()
+    }
 }

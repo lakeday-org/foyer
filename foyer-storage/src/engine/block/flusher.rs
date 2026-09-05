@@ -83,6 +83,14 @@ where
     Wait {
         tx: oneshot::Sender<()>,
     },
+    /// Force the flusher to release its current block (see `Splitter::split_and_close`) at the next flush, even
+    /// if nothing new has been written to it. Fire-and-forget: the caller learns the block was released by
+    /// observing `BlockManager::on_writing_finish` fire for it (e.g. via `retire_tail`'s `pending_retire` wait),
+    /// not from this submission directly.
+    // VERGLAS PATCH: live disk-resize needs this so a shrink can retire a block a flusher is holding open
+    // indefinitely as its "current" block — otherwise `retire_tail` would wait forever for a write that was
+    // never actually going to happen without new traffic.
+    Rotate,
 }
 
 impl<K, V, P> Debug for Submission<K, V, P>
@@ -112,6 +120,7 @@ where
                 f.debug_struct("Reinsertion").field("reinsertion", reinsertion).finish()
             }
             Self::Wait { .. } => f.debug_struct("Wait").finish(),
+            Self::Rotate => f.debug_struct("Rotate").finish(),
         }
     }
 }
@@ -197,7 +206,7 @@ where
         let buffer = Buffer::new(bytes, max_entry_size, metrics.clone());
         let buffer = Some(buffer);
 
-        let current_block_handle = block_manager.get_clean_block();
+        let current_block_handle = Some(block_manager.get_clean_block());
 
         let ctx = SplitCtx::new(block_size, blob_index_size);
 
@@ -221,6 +230,7 @@ where
             io_tasks: VecDeque::with_capacity(1),
             current_block_handle,
             max_entry_size,
+            force_rotate: false,
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch,
         };
@@ -253,6 +263,12 @@ where
         async move {
             let _ = rx.await;
         }
+    }
+
+    /// Ask this flusher to release its current block at the next flush (see `Submission::Rotate`).
+    // VERGLAS PATCH: live disk-resize.
+    pub(crate) fn rotate(&self) {
+        self.submit(Submission::Rotate);
     }
 }
 
@@ -307,7 +323,11 @@ where
 
     submit_queue_size: Arc<AtomicUsize>,
 
-    current_block_handle: GetCleanBlockHandle,
+    // VERGLAS PATCH: `None` means this flusher currently holds no block open for writing (it force-closed its
+    // previous one via `Submission::Rotate` and hasn't needed a replacement yet). A fresh block is fetched
+    // lazily, only once real data actually needs to land in it — never eagerly, since eagerly reserving one here
+    // could block forever on `get_clean_block()` if a concurrent shrink left no clean block spare.
+    current_block_handle: Option<GetCleanBlockHandle>,
 
     block_manager: BlockManager,
     indexer: Indexer,
@@ -322,6 +342,11 @@ where
     io_tasks: VecDeque<BoxFuture<'static, IoTaskCtx<K, V, P>>>,
 
     max_entry_size: usize,
+
+    /// Set by `Submission::Rotate`: the next flush must force the current block closed even if nothing new was
+    /// written to it this round. Cleared once that flush has been built.
+    // VERGLAS PATCH: live disk-resize (see `Splitter::split_and_close`).
+    force_rotate: bool,
 
     #[cfg(any(test, feature = "test_utils"))]
     flush_switch: Switch,
@@ -357,9 +382,13 @@ where
             #[cfg(any(test, feature = "test_utils"))]
             let can_flush = !self.flush_switch.is_on();
 
+            // VERGLAS PATCH: `force_rotate` (set by `Submission::Rotate`) must also trigger a flush cycle even
+            // when there is otherwise nothing to flush, or a shrink's request to release the current block would
+            // sit unprocessed forever.
             let need_flush = !self.buffer.as_ref().unwrap().is_empty()
                 || !self.waiters.is_empty()
-                || !self.tombstone_infos.is_empty();
+                || !self.tombstone_infos.is_empty()
+                || self.force_rotate;
             let no_io_task = self.io_tasks.is_empty();
 
             if can_flush && need_flush && no_io_task {
@@ -370,7 +399,12 @@ where
                 self.metrics.storage_block_engine_buffer_efficiency.record(efficiency);
 
                 let shared_io_slice = io_buffer.into_io_slice();
-                let batch = Splitter::split(&mut self.ctx, shared_io_slice, infos);
+                let force_rotate = std::mem::take(&mut self.force_rotate);
+                let batch = if force_rotate {
+                    Splitter::split_and_close(&mut self.ctx, shared_io_slice, infos)
+                } else {
+                    Splitter::split(&mut self.ctx, shared_io_slice, infos)
+                };
 
                 let tombstone_infos = std::mem::take(&mut self.tombstone_infos);
                 let waiters = std::mem::take(&mut self.waiters);
@@ -378,7 +412,17 @@ where
 
                 let init = self.queue_init.take().unwrap();
 
-                let io_task = self.submit_io_task(batch, piece_refs, tombstone_infos, waiters, init);
+                tracing::debug!(
+                    id = self.id,
+                    blocks = batch.blocks.len(),
+                    entries = piece_refs.len(),
+                    waiters = waiters.len(),
+                    force_rotate,
+                    current_block_handle_is_some = self.current_block_handle.is_some(),
+                    "[flusher]: committing batch summary"
+                );
+
+                let io_task = self.submit_io_task(batch, piece_refs, tombstone_infos, waiters, init, force_rotate);
                 self.io_tasks.push_back(io_task);
 
                 let io_buffer = self.rotate_buffer.take().unwrap();
@@ -389,9 +433,11 @@ where
             tokio::select! {
                 biased;
                 IoTaskCtx { handle, waiters, init, io_slice, tombstone_infos, piece_refs } = self.next_io_task_finish() => {
-                    if let Some(handle) = handle {
-                        self.current_block_handle = handle;
-                    }
+                    // VERGLAS PATCH: unconditional, not `if let Some`. `handle: None` is a real outcome now (a
+                    // forced rotation that closed the current block without eagerly reserving a replacement),
+                    // not just an unreachable empty-batch case — leaving `current_block_handle` stale here would
+                    // let a future batch keep writing into a block this flusher already gave up.
+                    self.current_block_handle = handle;
                     self.handle_io_complete(piece_refs, waiters, tombstone_infos, init);
                     // `try_into_io_buffer` must return `Some(..)` here.
                     self.rotate_buffer = io_slice.try_into_io_slice_mut();
@@ -429,6 +475,7 @@ where
                 estimated_size,
                 sequence,
             } => {
+                let piece_hash = piece.hash();
                 let enqueued = self.buffer.as_mut().unwrap().push(
                     piece.key(),
                     piece.value(),
@@ -438,6 +485,15 @@ where
                 );
                 if enqueued {
                     self.piece_refs.push(piece);
+                } else {
+                    // VERGLAS PATCH: a third, previously-unlogged silent-drop path (distinct from the two in
+                    // `BlockEngine::enqueue`): the entry passed admission and reached the flusher, but did not
+                    // fit in the current accumulation buffer (full, or larger than `max_entry_size`) and is
+                    // simply discarded, not retried.
+                    tracing::debug!(
+                        hash = piece_hash,
+                        "[flusher]: dropped cache entry, did not fit in buffer"
+                    );
                 }
                 report(enqueued);
                 self.submit_queue_size.fetch_sub(estimated_size, Ordering::Relaxed);
@@ -455,6 +511,7 @@ where
                 }
             }
             Submission::Wait { tx } => self.waiters.push(tx),
+            Submission::Rotate => self.force_rotate = true,
         }
     }
 
@@ -465,6 +522,9 @@ where
         tombstone_infos: Vec<TombstoneInfo>,
         waiters: Vec<oneshot::Sender<()>>,
         init: Instant,
+        // VERGLAS PATCH: forces every block in this batch closed (see `Splitter::split_and_close`) and the
+        // resulting `current_block_handle` to `None` instead of eagerly reserving a replacement.
+        force_close: bool,
     ) -> BoxFuture<'static, IoTaskCtx<K, V, P>> {
         let id = self.id;
 
@@ -476,10 +536,20 @@ where
             "[flusher] commit batch"
         );
 
+        // VERGLAS PATCH: if there is currently no reserved block (a prior `Submission::Rotate` force-closed it
+        // and nothing has replaced it yet), don't eagerly reserve one here just to satisfy the iterator below —
+        // `get_clean_block()` can block indefinitely if a concurrent shrink left no clean block spare. It is only
+        // actually needed if this batch has real data to write to it (or is itself force-closing it).
+        let current_was_none = self.current_block_handle.is_none();
+
         let block_handle_iter = if batch.blocks.is_empty() {
             vec![]
         } else {
-            std::iter::once(self.current_block_handle.clone())
+            let first = self
+                .current_block_handle
+                .clone()
+                .unwrap_or_else(|| self.block_manager.get_clean_block());
+            std::iter::once(first)
                 .chain((0..batch.blocks.len() - 1).map(|_| self.block_manager.get_clean_block()))
                 .collect_vec()
         };
@@ -496,8 +566,19 @@ where
                 let indexer = self.indexer.clone();
                 let block_manager = self.block_manager.clone();
                 let metrics = self.metrics.clone();
+                let force_close_this = force_close;
+                // VERGLAS PATCH: see `current_was_none` above. Only the first block can possibly be the "already
+                // had no reservation" case; every other index in this batch is a genuinely fresh
+                // `get_clean_block()` call this same commit just made (an intentional, pre-existing eager
+                // pre-fetch for the next round), which is unaffected.
+                let skip_handle = i == 0 && current_was_none && blob_parts.is_empty() && !force_close_this;
 
                 async move {
+                    if skip_handle {
+                        tracing::trace!(id, "[flusher]: no data and no block reserved, skip block resolution");
+                        return Ok::<_, Error>(None);
+                    }
+
                     // Wait for block is clean.
                     let block = block_handle.clone().await;
 
@@ -585,12 +666,14 @@ where
 
                     // Window expect window is full, make it evictable.
                     let id = block.id();
-                    if i != blocks - 1 {
+                    // VERGLAS PATCH: `force_close_this` closes even the last block of the batch, not just the
+                    // ones superseded within it (see `submit_io_task`'s `force_close` parameter).
+                    if force_close_this || i != blocks - 1 {
                         block_manager.on_writing_finish(block);
                     }
                     tracing::trace!(id, "[flusher]: write block finish.");
 
-                    Ok::<_, Error>(block_handle)
+                    Ok::<_, Error>(Some(block_handle))
                 }
             })
             .collect_vec();
@@ -616,13 +699,19 @@ where
             }
         };
 
-        let f: BoxFuture<'_, Result<(Vec<GetCleanBlockHandle>, ())>> = try_join(try_join_all(futures), future).boxed();
+        let f: BoxFuture<'_, Result<(Vec<Option<GetCleanBlockHandle>>, ())>> =
+            try_join(try_join_all(futures), future).boxed();
         let handle = self
             .spawner
             .spawn(f)
             .map(move |jres| match jres {
                 Ok(Ok((mut states, ()))) => IoTaskCtx {
-                    handle: states.pop(),
+                    // VERGLAS PATCH: `force_close` means every block in this batch (including the last) was
+                    // closed — there is no "current" block left to carry forward; `None` here now means exactly
+                    // that (see the `IoTaskCtx { handle, .. }` match arm in `run()`). Otherwise, the last block's
+                    // slot is `None` only if it was `skip_handle`-ed (nothing reserved, nothing written), in
+                    // which case there is likewise nothing new to carry forward.
+                    handle: if force_close { None } else { states.pop().flatten() },
                     piece_refs,
                     waiters,
                     init,

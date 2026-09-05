@@ -147,6 +147,12 @@ impl Device for CombinedDevice {
     fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
     }
+
+    // VERGLAS PATCH: a combined device multiplexes several independent inner devices; resizing "the device"
+    // is ambiguous (which inner device's physical extent should change?). No silent fallback: refuse explicitly.
+    fn set_physical_len(&self, _bytes: u64) -> Result<()> {
+        Err(Error::unsupported("set_physical_len", "CombinedDevice"))
+    }
 }
 
 #[derive(Debug)]

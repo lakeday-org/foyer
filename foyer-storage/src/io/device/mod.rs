@@ -92,6 +92,29 @@ pub trait Device: Send + Sync + 'static + Debug + Any {
 
     /// Get the statistics of the device this partition belongs to.
     fn statistics(&self) -> &Arc<Statistics>;
+
+    /// Get the current physical length of the backing storage, in bytes.
+    ///
+    /// For devices that do not support live resize, this always equals `capacity()`: the backing storage never
+    /// shrinks below its opened capacity for those devices, so there is nothing to inspect.
+    // VERGLAS PATCH: pairs with `set_physical_len` so the block engine can learn, on reopen, how much of a
+    // device's ceiling capacity is actually backed by bytes on disk (a live shrink truncates the file; a
+    // reopened store must recover the truncated tail as retired instead of scanning it).
+    fn physical_len(&self) -> Result<u64> {
+        Ok(self.capacity() as u64)
+    }
+
+    /// Physically resize the backing storage to exactly `bytes`.
+    ///
+    /// `bytes` must be less than or equal to `capacity()`. Growing is metadata-only for sparse-file-backed
+    /// devices; shrinking physically truncates the backing storage, discarding any bytes beyond `bytes`.
+    ///
+    /// Returns an [`foyer_common::error::ErrorKind::Unsupported`] error for devices that cannot resize their
+    /// physical backing storage independently of their logical capacity (multi-file and composed devices).
+    // VERGLAS PATCH: primitive the watermark-resize block engine uses to shrink/grow the device that backs a
+    // retired/restored tail of blocks. No silent fallback: devices that cannot honor this precisely return an
+    // explicit error instead of silently no-oping or resizing something else.
+    fn set_physical_len(&self, bytes: u64) -> Result<()>;
 }
 
 pub mod file;
