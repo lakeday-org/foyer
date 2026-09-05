@@ -11,7 +11,9 @@ that release branch. Consumers must pin the reviewed patch commit by SHA.
 The source and regression tests are preserved from commits `a802626` and
 `58a7f001d8cd894423106713904daf948db20e65` in the former
 `verglas-org/verglas-foyer` repository. This migration does not change their
-behavior. Existing `VERGLAS PATCH` comments record their provenance.
+behavior. Existing `VERGLAS PATCH` comments record their provenance. Linux CI
+also required removing one redundant `.into_iter()` in the upstream io_uring
+implementation for Rust 1.96.1 Clippy; that correction does not change behavior.
 
 - Live disk reclamation through `HybridCache::resize_disk`, `Store`, and the
   block engine. Shrinking retires tail blocks before truncating the backing
