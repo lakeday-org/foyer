@@ -25,10 +25,6 @@ pub struct Metrics {
     pub memory_miss: BoxedCounter,
     pub memory_remove: BoxedCounter,
     pub memory_evict: BoxedCounter,
-    pub memory_reinsert: BoxedCounter,
-    pub memory_release: BoxedCounter,
-    pub memory_queue: BoxedCounter,
-    pub memory_fetch: BoxedCounter,
 
     pub memory_usage: BoxedGauge,
     pub memory_entries: BoxedGauge,
@@ -55,14 +51,12 @@ pub struct Metrics {
 
     pub storage_disk_write: BoxedCounter,
     pub storage_disk_read: BoxedCounter,
-    pub storage_disk_flush: BoxedCounter,
 
     pub storage_disk_write_bytes: BoxedCounter,
     pub storage_disk_read_bytes: BoxedCounter,
 
     pub storage_disk_write_duration: BoxedHistogram,
     pub storage_disk_read_duration: BoxedHistogram,
-    pub storage_disk_flush_duration: BoxedHistogram,
 
     pub storage_block_engine_block_clean: BoxedGauge,
     pub storage_block_engine_block_writing: BoxedGauge,
@@ -83,14 +77,12 @@ pub struct Metrics {
     pub hybrid_insert: BoxedCounter,
     pub hybrid_hit: BoxedCounter,
     pub hybrid_miss: BoxedCounter,
-    pub hybrid_throttled: BoxedCounter,
     pub hybrid_remove: BoxedCounter,
     pub hybrid_error: BoxedCounter,
 
     pub hybrid_insert_duration: BoxedHistogram,
     pub hybrid_hit_duration: BoxedHistogram,
     pub hybrid_miss_duration: BoxedHistogram,
-    pub hybrid_throttled_duration: BoxedHistogram,
     pub hybrid_remove_duration: BoxedHistogram,
     pub hybrid_error_duration: BoxedHistogram,
 }
@@ -130,10 +122,6 @@ impl Metrics {
         let memory_miss = foyer_memory_op_total.counter(&[name.clone(), "miss".into()]);
         let memory_remove = foyer_memory_op_total.counter(&[name.clone(), "remove".into()]);
         let memory_evict = foyer_memory_op_total.counter(&[name.clone(), "evict".into()]);
-        let memory_reinsert = foyer_memory_op_total.counter(&[name.clone(), "reinsert".into()]);
-        let memory_release = foyer_memory_op_total.counter(&[name.clone(), "release".into()]);
-        let memory_queue = foyer_memory_op_total.counter(&[name.clone(), "queue".into()]);
-        let memory_fetch = foyer_memory_op_total.counter(&[name.clone(), "fetch".into()]);
 
         let memory_usage = foyer_memory_usage.gauge(std::slice::from_ref(&name));
         let memory_entries = foyer_memory_entries.gauge(std::slice::from_ref(&name));
@@ -250,14 +238,12 @@ impl Metrics {
 
         let storage_disk_write = foyer_storage_disk_io_total.counter(&[name.clone(), "write".into()]);
         let storage_disk_read = foyer_storage_disk_io_total.counter(&[name.clone(), "read".into()]);
-        let storage_disk_flush = foyer_storage_disk_io_total.counter(&[name.clone(), "flush".into()]);
 
         let storage_disk_write_bytes = foyer_storage_disk_io_bytes.counter(&[name.clone(), "write".into()]);
         let storage_disk_read_bytes = foyer_storage_disk_io_bytes.counter(&[name.clone(), "read".into()]);
 
         let storage_disk_write_duration = foyer_storage_disk_io_duration.histogram(&[name.clone(), "write".into()]);
         let storage_disk_read_duration = foyer_storage_disk_io_duration.histogram(&[name.clone(), "read".into()]);
-        let storage_disk_flush_duration = foyer_storage_disk_io_duration.histogram(&[name.clone(), "flush".into()]);
 
         let storage_block_engine_block_clean = foyer_storage_block_engine_block.gauge(&[name.clone(), "clean".into()]);
         let storage_block_engine_block_writing =
@@ -300,14 +286,12 @@ impl Metrics {
         let hybrid_insert = foyer_hybrid_op_total.counter(&[name.clone(), "insert".into()]);
         let hybrid_hit = foyer_hybrid_op_total.counter(&[name.clone(), "hit".into()]);
         let hybrid_miss = foyer_hybrid_op_total.counter(&[name.clone(), "miss".into()]);
-        let hybrid_throttled = foyer_hybrid_op_total.counter(&[name.clone(), "throttled".into()]);
         let hybrid_remove = foyer_hybrid_op_total.counter(&[name.clone(), "remove".into()]);
         let hybrid_error = foyer_hybrid_op_total.counter(&[name.clone(), "error".into()]);
 
         let hybrid_insert_duration = foyer_hybrid_op_duration.histogram(&[name.clone(), "insert".into()]);
         let hybrid_hit_duration = foyer_hybrid_op_duration.histogram(&[name.clone(), "hit".into()]);
         let hybrid_miss_duration = foyer_hybrid_op_duration.histogram(&[name.clone(), "miss".into()]);
-        let hybrid_throttled_duration = foyer_hybrid_op_duration.histogram(&[name.clone(), "throttled".into()]);
         let hybrid_remove_duration = foyer_hybrid_op_duration.histogram(&[name.clone(), "remove".into()]);
         let hybrid_error_duration = foyer_hybrid_op_duration.histogram(&[name.clone(), "error".into()]);
 
@@ -318,10 +302,6 @@ impl Metrics {
             memory_miss,
             memory_remove,
             memory_evict,
-            memory_reinsert,
-            memory_release,
-            memory_queue,
-            memory_fetch,
             memory_usage,
             memory_entries,
 
@@ -343,12 +323,10 @@ impl Metrics {
             storage_queue_channel_overflow,
             storage_disk_write,
             storage_disk_read,
-            storage_disk_flush,
             storage_disk_write_bytes,
             storage_disk_read_bytes,
             storage_disk_write_duration,
             storage_disk_read_duration,
-            storage_disk_flush_duration,
             storage_block_engine_block_clean,
             storage_block_engine_block_writing,
             storage_block_engine_block_evictable,
@@ -364,8 +342,6 @@ impl Metrics {
             hybrid_insert,
             hybrid_hit,
             hybrid_miss,
-            hybrid_throttled,
-            hybrid_throttled_duration,
             hybrid_remove,
             hybrid_error,
             hybrid_insert_duration,
