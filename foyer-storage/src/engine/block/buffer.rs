@@ -314,6 +314,17 @@ impl SplitCtx {
             blob_index_size,
         }
     }
+
+    /// Reset the split context to the initial state of a fresh clean block.
+    ///
+    /// This must be called when the carried-over current block is discarded (e.g. after an IO
+    /// task failure) and replaced with a freshly-acquired clean block, so that the splitter
+    /// resumes writing from the beginning of the new block instead of at stale offsets.
+    pub fn reset(&mut self) {
+        self.current_part_blob_offset = self.blob_index_size;
+        self.current_blob_index.reset();
+        self.current_blob_block_offset = 0;
+    }
 }
 
 #[derive(Debug)]
@@ -747,6 +758,62 @@ mod tests {
                 ],
                 bytes: shared_io_slice,
             }
+        );
+    }
+
+    #[test_log::test]
+    fn test_split_ctx_reset() {
+        const BLOCK_SIZE: usize = 16 * KB;
+        const BLOB_INDEX_SIZE: usize = 4 * KB;
+        const BATCH_SIZE: usize = 64 * KB;
+
+        // Advance the context to a non-initial, partially-filled state.
+        let mut ctx = SplitCtx::new(BLOCK_SIZE, BLOB_INDEX_SIZE);
+        ctx.current_blob_block_offset = 8 * KB;
+        ctx.current_part_blob_offset = 6 * KB;
+        for i in 0..ctx.current_blob_index.capacity() {
+            ctx.current_blob_index.write(&BlobEntryIndex {
+                hash: i as u64,
+                sequence: i as u64,
+                offset: i as u32,
+                len: i as u32,
+            });
+        }
+        assert!(ctx.current_blob_index.is_full());
+
+        ctx.reset();
+
+        // After reset the splitter state must match a freshly-created context,
+        // so the next flush writes from the beginning of a fresh block.
+        assert_eq!(ctx.current_blob_block_offset, 0);
+        assert_eq!(ctx.current_part_blob_offset, BLOB_INDEX_SIZE);
+        assert!(!ctx.current_blob_index.is_full());
+        assert_eq!(ctx.block_size, BLOCK_SIZE);
+        assert_eq!(ctx.blob_index_size, BLOB_INDEX_SIZE);
+
+        // Splitting after reset must place the entry at the start of a new
+        // block (offset 0, blob part offset = blob index size).
+        let infos = vec![BufferEntryInfo {
+            hash: 1,
+            sequence: 1,
+            offset: 0,
+            len: 3 * KB,
+        }];
+        let buf = IoSliceMut::new(BATCH_SIZE).into_io_slice();
+        let batch = Splitter::split(&mut ctx, buf.clone(), infos);
+        assert_eq!(batch.bytes, buf);
+        assert_eq!(batch.blocks.len(), 1);
+        assert_eq!(batch.blocks[0].blob_parts.len(), 1);
+        assert_eq!(batch.blocks[0].blob_parts[0].blob_block_offset, 0);
+        assert_eq!(batch.blocks[0].blob_parts[0].part_blob_offset, BLOB_INDEX_SIZE);
+        assert_eq!(
+            batch.blocks[0].blob_parts[0].indices,
+            vec![BlobEntryIndex {
+                hash: 1,
+                sequence: 1,
+                offset: BLOB_INDEX_SIZE as u32,
+                len: 3 * KB as u32,
+            }]
         );
     }
 }
