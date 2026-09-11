@@ -144,7 +144,19 @@ impl Indexer {
             for (hash, sequence) in hashes {
                 match shard.entry(hash) {
                     Entry::Occupied(o) => {
+                        // Only evict live `Address` entries; always retain `Tombstone`
+                        // markers as a per-hash deletion watermark. The flusher calls
+                        // `remove_batch` after persisting a tombstone; if the tombstone
+                        // were dropped here the slot would become `Vacant`, and a stale
+                        // in-flight reinsertion (older than the delete) would later be
+                        // installed unconditionally by the `Vacant` branch of
+                        // `insert_inner`, resurrecting the deleted entry. Keeping the
+                        // tombstone lets the `Occupied`-branch sequence guard reject
+                        // such stale reinsertions (`old_seq >= tombstone_seq` is false).
+                        // A newer reinsertion/insert still supersedes the tombstone via
+                        // the same sequence guard.
                         if sequence >= o.get().sequence()
+                            && let Index::Address(_) = o.get()
                             && let Some(addr) = self.extract_address(o.remove())
                         {
                             olds.push(addr);
@@ -190,5 +202,85 @@ impl Indexer {
             Index::Address(addr) => Some(addr),
             Index::Tombstone(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(sequence: Sequence) -> EntryAddress {
+        EntryAddress {
+            block: 1,
+            offset: 0,
+            len: 64,
+            sequence,
+        }
+    }
+
+    fn hadrr(hash: u64, sequence: Sequence) -> HashedEntryAddress {
+        HashedEntryAddress {
+            hash,
+            address: addr(sequence),
+        }
+    }
+
+    /// After the flusher persists a tombstone and calls `remove_batch`, the
+    /// tombstone must NOT be erased from the indexer. It stays as a deletion
+    /// watermark so that a stale in-flight reinsertion (older than the delete)
+    /// landing in `insert_batch` is rejected by the `Occupied`-branch sequence
+    /// guard instead of being installed into a `Vacant` slot.
+    #[test]
+    fn stale_reinsertion_after_tombstone_persist_is_rejected() {
+        let indexer = Indexer::new(4);
+        let hash = 42u64;
+
+        // Live entry @ S10.
+        indexer.insert_batch(vec![hadrr(hash, 10)]);
+        assert_eq!(indexer.get(hash), Some(addr(10)));
+
+        // Delete @ S20.
+        indexer.insert_tombstone(hash, 20);
+        assert_eq!(indexer.get(hash), None);
+
+        // Flusher persists the tombstone and removes it; the watermark must persist.
+        indexer.remove_batch(vec![(hash, 20)]);
+        assert_eq!(indexer.get(hash), None);
+
+        // Stale reinsertion @ S10 arrives after the tombstone was persisted.
+        indexer.insert_batch(vec![hadrr(hash, 10)]);
+        assert!(
+            indexer.get(hash).is_none(),
+            "deleted entry must not reappear, but got {:?}",
+            indexer.get(hash)
+        );
+    }
+
+    /// A newer reinsertion/insert must supersede a retained tombstone and become
+    /// live again (the delete is "undone" by a fresh write with a higher sequence).
+    #[test]
+    fn newer_insert_supersedes_retained_tombstone() {
+        let indexer = Indexer::new(4);
+        let hash = 42u64;
+        indexer.insert_batch(vec![hadrr(hash, 10)]);
+        indexer.insert_tombstone(hash, 20);
+        indexer.remove_batch(vec![(hash, 20)]);
+        // Re-write at S30 (> S20) replaces the retained tombstone with a live address.
+        // A superseding insert produces no "old" evicted address (the displaced
+        // value was a tombstone, which carries no address).
+        assert!(indexer.insert_batch(vec![hadrr(hash, 30)]).is_empty());
+        assert_eq!(indexer.get(hash), Some(addr(30)));
+    }
+
+    /// `remove_batch` must still evict live `Address` entries: the reclaimer relies
+    /// on it to drop addresses of unpicked entries while reclaiming a block.
+    #[test]
+    fn remove_batch_still_evicts_live_addresses() {
+        let indexer = Indexer::new(4);
+        let hash = 42u64;
+        indexer.insert_batch(vec![hadrr(hash, 10)]);
+        let olds = indexer.remove_batch(vec![(hash, 10)]);
+        assert_eq!(olds, vec![addr(10)]);
+        assert_eq!(indexer.get(hash), None);
     }
 }
