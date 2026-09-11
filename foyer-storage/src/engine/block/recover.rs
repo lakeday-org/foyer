@@ -42,6 +42,24 @@ use crate::engine::{
 #[derive(Debug)]
 pub struct RecoverRunner;
 
+/// Order recovered evictable `(block_id, latest_entry_sequence)` pairs oldest-written
+/// (lowest sequence) first.
+///
+/// [`FifoPicker`](super::eviction::FifoPicker) and other order-sensitive eviction pickers
+/// reconstruct their eviction queue from the call order of
+/// [`EvictionPicker::on_block_evictable`](super::eviction::EvictionPicker::on_block_evictable).
+/// After a restart the picker queue must be rebuilt in true write-recency order, otherwise
+/// a newer-written recovered block may be evicted before an older-written one.
+///
+/// Block ids are **not** a reliable recency proxy: they are recycled after reclamation
+/// (a reclaimed id is returned to the back of the clean list and later reused), so a low
+/// id may hold data written more recently than a high id. The persisted per-entry write
+/// `sequence` is monotonic across the cache lifetime and is therefore the correct key.
+fn order_evictable_blocks_by_sequence(mut evictable_blocks: Vec<(BlockId, Sequence)>) -> Vec<BlockId> {
+    evictable_blocks.sort_by_key(|(_, sequence)| *sequence);
+    evictable_blocks.into_iter().map(|(block, _)| block).collect()
+}
+
 impl RecoverRunner {
     #[expect(clippy::too_many_arguments)]
     pub async fn run(
@@ -89,7 +107,7 @@ impl RecoverRunner {
         let mut latest_sequence = 0;
         let mut indices: HashMap<u64, (Sequence, EntryAddressOrTombstone)> = HashMap::new();
         let mut clean_blocks = vec![];
-        let mut evictable_blocks = vec![];
+        let mut evictable_blocks: Vec<(BlockId, Sequence)> = vec![];
 
         let mut insert_or_update =
             |hash: u64, sequence: Sequence, addr: EntryAddressOrTombstone| match indices.entry(hash) {
@@ -109,14 +127,20 @@ impl RecoverRunner {
 
             if infos.is_empty() {
                 clean_blocks.push(block);
-            } else {
-                evictable_blocks.push(block);
+                continue;
             }
 
+            // A block's recency (FIFO age) is the sequence of its latest write, i.e. the
+            // maximum `addr.sequence` among its entries. Recovery has this per-entry data
+            // available and only needs to aggregate it per block so that the evictable
+            // blocks can be fed to the pickers in true oldest-written-first order below.
+            let mut max_sequence = 0;
             for EntryInfo { hash, addr } in infos {
                 latest_sequence = latest_sequence.max(addr.sequence);
+                max_sequence = max_sequence.max(addr.sequence);
                 insert_or_update(hash, addr.sequence, EntryAddressOrTombstone::EntryAddress(addr));
             }
+            evictable_blocks.push((block, max_sequence));
         }
         tombstones.iter().for_each(|tombstone| {
             latest_sequence = latest_sequence.max(tombstone.sequence);
@@ -145,7 +169,13 @@ impl RecoverRunner {
         // Update components.
         indexer.insert_batch(indices);
         sequence.store(latest_sequence + 1, Ordering::Release);
-        block_manager.init(&clean_blocks);
+
+        // Feed the recovered evictable blocks to the block manager in oldest-written-first
+        // order. `FifoPicker` and other order-sensitive pickers rely on this call order to
+        // reconstruct their eviction queue across restarts; an unordered iteration here
+        // would corrupt FIFO eviction order for the recovered cohort.
+        let evictable_blocks = order_evictable_blocks_by_sequence(evictable_blocks);
+        block_manager.init(&clean_blocks, &evictable_blocks);
 
         let elapsed = now.elapsed();
         tracing::info!("[recover] finish in {:?}", elapsed);
@@ -195,5 +225,35 @@ impl BlockRecoverRunner {
         }
 
         Ok(recovered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_evictable_blocks_by_sequence;
+    use crate::engine::block::{manager::BlockId, serde::Sequence};
+
+    #[test]
+    fn test_order_evictable_blocks_by_sequence_uses_sequence_not_block_id() {
+        // (block_id, latest entry sequence). Block id 0 holds the NEWEST write (its id was
+        // recycled after a reclamation cycle), so it must be ordered last despite being the
+        // lowest id. Ordering by block id would wrongly evict it first.
+        let input: Vec<(BlockId, Sequence)> = vec![(0, 80), (2, 20), (3, 30), (5, 50), (7, 70)];
+        let ordered = order_evictable_blocks_by_sequence(input);
+        assert_eq!(ordered, vec![2, 3, 5, 7, 0]);
+    }
+
+    #[test]
+    fn test_order_evictable_blocks_by_sequence_empty() {
+        assert!(order_evictable_blocks_by_sequence(vec![]).is_empty());
+    }
+
+    #[test]
+    fn test_order_evictable_blocks_by_sequence_ties_preserve_block_id_order() {
+        // Recovery feeds blocks in ascending block-id order; `sort_by_key` is stable, so
+        // blocks sharing a sequence (e.g. written in the same flush batch) keep that order.
+        let input: Vec<(BlockId, Sequence)> = vec![(1, 10), (2, 10), (5, 10), (9, 10)];
+        let ordered = order_evictable_blocks_by_sequence(input);
+        assert_eq!(ordered, vec![1, 2, 5, 9]);
     }
 }

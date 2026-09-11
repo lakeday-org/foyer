@@ -233,22 +233,26 @@ impl BlockManager {
         Ok(this)
     }
 
-    pub fn init(&self, clean_blocks: &[BlockId]) {
+    /// Rebuild the block manager state after recovery.
+    ///
+    /// `clean_blocks` are the recovered blocks that hold no data (reusable right away).
+    ///
+    /// `evictable_blocks` are the recovered blocks that hold data, and **must** be ordered
+    /// oldest-written-first. Order-sensitive eviction pickers such as [`FifoPicker`]
+    /// reconstruct their eviction queue from the call order of
+    /// [`EvictionPicker::on_block_evictable`]; feeding them in an arbitrary (e.g.
+    /// `HashSet`) order would corrupt FIFO eviction order across restarts. Block ids are
+    /// recycled after reclamation, so the caller must derive the order from the persisted
+    /// per-entry write `sequence` rather than from the block id.
+    pub fn init(&self, clean_blocks: &[BlockId], evictable_blocks: &[BlockId]) {
         let mut state = self.inner.state.write().unwrap();
-        let mut evictable_blocks: HashSet<BlockId> = self.inner.blocks.iter().map(|r| r.id()).collect();
-        state.clean_blocks = clean_blocks
-            .iter()
-            .inspect(|id| {
-                evictable_blocks.remove(id);
-            })
-            .copied()
-            .collect();
+        state.clean_blocks = clean_blocks.iter().copied().collect();
 
-        // Temporarily take pickers to make borrow checker happy.
+        // Temporarily take pickers to make the borrow checker happy.
         let mut pickers = std::mem::take(&mut state.eviction_pickers);
 
-        // Notify pickers.
-        for block in evictable_blocks {
+        // Notify pickers in the supplied recency order (oldest-written first).
+        for &block in evictable_blocks {
             state.evictable_blocks.insert(block);
             for picker in pickers.iter_mut() {
                 picker.on_block_evictable(

@@ -894,8 +894,16 @@ mod tests {
         dir: impl AsRef<Path>,
         reinsertion_filter: StorageFilter,
     ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        store_for_test_with_capacity(dir, ByteSize::kib(64), reinsertion_filter).await
+    }
+
+    async fn store_for_test_with_capacity(
+        dir: impl AsRef<Path>,
+        capacity: ByteSize,
+        reinsertion_filter: StorageFilter,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
         let device = FsDeviceBuilder::new(dir)
-            .with_capacity(ByteSize::kib(64).as_u64() as _)
+            .with_capacity(capacity.as_u64() as _)
             .build()
             .unwrap();
         let spawner = Spawner::current();
@@ -1077,6 +1085,100 @@ mod tests {
         assert_eq!(r5, (5, vec![5; 11 * KB]));
         let r6 = store.load(memory.hash(&6)).await.unwrap().kv().unwrap();
         assert_eq!(r6, (6, vec![6; 7 * KB]));
+    }
+
+    /// Regression test for FIFO eviction order after a restart.
+    ///
+    /// `FifoPicker` rebuilds its eviction queue from the call order of
+    /// `on_block_evictable` during recovery. If the recovered blocks are fed in arbitrary
+    /// (e.g. `HashSet`) order, the queue is permuted and a newer-written recovered block
+    /// may be evicted before an older-written one.
+    ///
+    /// This writes one entry per block across 7 of 8 blocks (leaving one clean), restarts,
+    /// then drives evictions one at a time and asserts the recovered blocks are reclaimed in
+    /// true oldest-written-first order (keys 0, 1, 2, 3).
+    #[test_log::test(tokio::test)]
+    async fn test_store_fifo_eviction_order_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = CacheBuilder::new(64)
+            .with_shards(1)
+            .with_eviction_config(FifoConfig::default())
+            .with_hash_builder(ModHasher::default())
+            .build();
+
+        // 8 blocks of 16 KiB (128 KiB). Each 11 KiB entry exactly fills a block's data
+        // region (16 KiB - 4 KiB blob index), so exactly one entry lands per block.
+        let store = store_for_test_with_capacity(
+            dir.path(),
+            ByteSize::kib(128),
+            StorageFilter::new().with_condition(RejectAll),
+        )
+        .await;
+
+        // Fill blocks 0..6 (one entry per block, written in ascending key = ascending
+        // sequence order), leaving block 7 clean. No eviction occurs because the clean
+        // block count never drops below the threshold of 1.
+        for k in 0..7u64 {
+            let e = memory.insert(k, vec![k as u8; 11 * KB]);
+            enqueue(&store, e);
+            store.wait().await;
+        }
+        for k in 0..7u64 {
+            assert_eq!(
+                store.load(memory.hash(&k)).await.unwrap().kv(),
+                Some((k, vec![k as u8; 11 * KB]))
+            );
+        }
+
+        store.close().await.unwrap();
+        drop(store);
+
+        // Reopen: blocks 0..6 are recovered as evictable (each holds one entry), block 7 is
+        // clean. `FifoPicker` must re-queue them oldest-written-first (key 0 .. key 6).
+        let store = store_for_test_with_capacity(
+            dir.path(),
+            ByteSize::kib(128),
+            StorageFilter::new().with_condition(RejectAll),
+        )
+        .await;
+        for k in 0..7u64 {
+            assert_eq!(
+                store.load(memory.hash(&k)).await.unwrap().kv(),
+                Some((k, vec![k as u8; 11 * KB])),
+                "recovered entry {k} must survive restart"
+            );
+        }
+
+        // Each new write consumes the sole clean block and forces eviction of the
+        // oldest recovered block. Assert the eviction order is true FIFO across four
+        // consecutive evictions (the recovered blocks holding keys 0, 1, 2, 3 in order).
+        for evicted in 0..4u64 {
+            let new = evicted + 100;
+            let e = memory.insert(new, vec![new as u8; 11 * KB]);
+            enqueue(&store, e);
+            store.wait().await;
+
+            // The oldest remaining recovered block (holding `evicted`) is reclaimed first.
+            assert!(
+                store.load(memory.hash(&evicted)).await.unwrap().kv().is_none(),
+                "after restart, recovered block holding key {evicted} should be evicted in FIFO order"
+            );
+            // All other recovered entries survive.
+            for k in (evicted + 1)..7u64 {
+                assert_eq!(
+                    store.load(memory.hash(&k)).await.unwrap().kv(),
+                    Some((k, vec![k as u8; 11 * KB])),
+                    "recovered entry {k} must survive while older recovered blocks remain"
+                );
+            }
+            // The newly-written entry is present.
+            assert_eq!(
+                store.load(memory.hash(&new)).await.unwrap().kv(),
+                Some((new, vec![new as u8; 11 * KB])),
+                "newly written entry {new} must be present"
+            );
+        }
     }
 
     #[test_log::test(tokio::test)]
