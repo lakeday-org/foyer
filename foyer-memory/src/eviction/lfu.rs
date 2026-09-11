@@ -271,6 +271,31 @@ where
         self.window_weight_capacity = window_weight_capacity;
         self.protected_weight_capacity = protected_weight_capacity;
 
+        // Re-establish the per-queue weight invariants after the capacity budgets changed, so that a
+        // shrink does not leave `protected` (or `window`) over budget. Without this, the subsequent
+        // `evict`/`pop` loop drains `window` and `probation` first (pop only touches `protected` when
+        // both are empty), leaving all surviving entries in an over-budget `protected` and the cache
+        // unable to admit new entries. Mirror the overflow loops in `push` and `acquire` and the
+        // invariant-restoring behavior of `Lru::update`'s `may_overflow_high_priority_pool`.
+        while self.protected_weight > self.protected_weight_capacity {
+            strict_assert!(!self.protected.is_empty());
+            let r = self.protected.pop_front().unwrap();
+            let s = unsafe { &mut *r.state().get() };
+            self.decrease_queue_weight(Queue::Protected, r.weight());
+            s.queue = Queue::Probation;
+            self.increase_queue_weight(Queue::Probation, r.weight());
+            self.probation.push_back(r);
+        }
+        while self.window_weight > self.window_weight_capacity {
+            strict_assert!(!self.window.is_empty());
+            let r = self.window.pop_front().unwrap();
+            let s = unsafe { &mut *r.state().get() };
+            self.decrease_queue_weight(Queue::Window, r.weight());
+            s.queue = Queue::Probation;
+            self.increase_queue_weight(Queue::Probation, r.weight());
+            self.probation.push_back(r);
+        }
+
         Ok(())
     }
 
@@ -664,5 +689,290 @@ mod tests {
 
         lfu.clear();
         assert_ptr_vec_vec_eq(lfu.dump(), vec![vec![], vec![], vec![]]);
+    }
+
+    /// Regression test for the in-memory cache online resize (`Cache::resize`) shrink freeze.
+    ///
+    /// `Lfu::update` is invoked on every resize to refresh the per-queue weight budgets, followed
+    /// by `evict` (`RawCacheShard::resize`). Before the fix, `update` recomputed the budgets but did
+    /// not rebalance existing records across the queues. After a shrink, the `pop`-driven eviction
+    /// loop drained `window` and `probation` completely before touching `protected`, leaving the
+    /// cache with an over-budget `protected` queue and **empty** `window`/`probation` queues. In that
+    /// state every new insert was immediately evicted (`pop` saw an empty `probation` and
+    /// unconditionally removed from `window`), freezing the cache.
+    ///
+    /// This test reproduces that scenario and asserts the post-fix invariants:
+    ///   * after `update`, neither `protected` nor `window` exceeds its refreshed budget;
+    ///   * the invariant survives the subsequent `evict`;
+    ///   * `probation` is non-empty after the shrink (the frozen-cache condition does not hold);
+    ///   * a hot re-inserted entry is admitted instead of being unconditionally evicted.
+    #[test]
+    fn test_lfu_update_rebalance_on_shrink() {
+        // w-TinyLFU budgets: window = 20%, protected = 60%, probation = the remainder.
+        let config = LfuConfig {
+            window_capacity_ratio: 0.2,
+            protected_capacity_ratio: 0.6,
+            cmsketch_eps: 0.01,
+            cmsketch_confidence: 0.95,
+        };
+        let capacity = 100;
+        let mut lfu = TestLfu::new(capacity, &config);
+
+        // window_weight_capacity = 20, protected_weight_capacity = 60.
+        assert_eq!(lfu.window_weight_capacity, 20);
+        assert_eq!(lfu.protected_weight_capacity, 60);
+
+        let rs = (0..100)
+            .map(|i| {
+                Arc::new(Record::new(Data {
+                    key: i,
+                    value: i,
+                    properties: TestProperties::default(),
+                    hash: i,
+                    weight: 1,
+                }))
+            })
+            .collect_vec();
+
+        // Fill: each push lands in `window`; `window` overflows its LRU entries to `probation`.
+        (0..100).for_each(|i| lfu.push(rs[i].clone()));
+        assert_eq!(lfu.window_weight, 20);
+        assert_eq!(lfu.probation_weight, 80);
+        assert_eq!(lfu.protected_weight, 0);
+
+        // Acquire each probation entry once: it is promoted to `protected`; when `protected`
+        // exceeds its budget its LRU entry overflows back to `probation`.
+        (0..80).for_each(|i| lfu.acquire_mutable(&rs[i]));
+        // Steady state: window = 20, probation = 20, protected = 60 (== its budget).
+        assert_eq!(lfu.window_weight, 20);
+        assert_eq!(lfu.probation_weight, 20);
+        assert_eq!(lfu.protected_weight, 60);
+        assert_eq!(lfu.protected_weight, lfu.protected_weight_capacity);
+        assert_eq!(
+            lfu.window_weight + lfu.probation_weight + lfu.protected_weight,
+            capacity
+        );
+
+        // Shrink to 50 — this is the `eviction.update(capacity, None)` step of `RawCacheShard::resize`.
+        lfu.update(50, None).unwrap();
+        // Refreshed budgets: window = 10, protected = 30.
+        assert_eq!(lfu.window_weight_capacity, 10);
+        assert_eq!(lfu.protected_weight_capacity, 30);
+
+        // *** Fix ***: `update` must rebalance the queues so neither `protected` nor `window` remains
+        // above its new budget. Before the fix, `protected` stayed at 60 (> 30) and `window` at 20
+        // (> 10); the following eviction then drained `window`+`probation` first (pop only touches
+        // `protected` once both are empty), freezing the cache.
+        assert!(
+            lfu.protected_weight <= lfu.protected_weight_capacity,
+            "protected_weight {} must be <= protected_weight_capacity {} after update",
+            lfu.protected_weight,
+            lfu.protected_weight_capacity
+        );
+        assert!(
+            lfu.window_weight <= lfu.window_weight_capacity,
+            "window_weight {} must be <= window_weight_capacity {} after update",
+            lfu.window_weight,
+            lfu.window_weight_capacity
+        );
+        // `update` only moves records between queues; it must not drop any (the subsequent `evict`
+        // owns removal).
+        assert_eq!(
+            lfu.window_weight + lfu.probation_weight + lfu.protected_weight,
+            capacity
+        );
+
+        // Evict down to the new capacity — mirrors `RawCacheShard::resize`'s `evict(target)`.
+        let mut evicted = vec![];
+        while lfu.window_weight + lfu.probation_weight + lfu.protected_weight > 50 {
+            evicted.push(lfu.pop().unwrap());
+        }
+        assert_eq!(lfu.window_weight + lfu.probation_weight + lfu.protected_weight, 50);
+        assert_eq!(evicted.len(), 50);
+
+        // The per-queue invariants must survive the eviction.
+        assert!(lfu.protected_weight <= lfu.protected_weight_capacity);
+        assert!(lfu.window_weight <= lfu.window_weight_capacity);
+
+        // Anti-freeze: after the shrink, `probation` must not be empty. The buggy terminal state had
+        // `window` and `probation` both empty with `protected` over budget, so every new insert was
+        // unconditionally evicted (pop matched `(Some(_), None)` and removed from `window` without a
+        // frequency comparison). With `probation` non-empty, pop performs a frequency admission
+        // comparison and hot new entries can be admitted.
+        assert!(
+            !lfu.probation.is_empty(),
+            "probation must not be empty after shrink; the freeze leaves window+probation drained"
+        );
+        assert!(
+            !(lfu.window.is_empty()
+                && lfu.probation.is_empty()
+                && lfu.protected_weight > lfu.protected_weight_capacity),
+            "cache must not be frozen (window+probation empty with protected over budget) after shrink"
+        );
+
+        // Admission round-trip: re-insert a key that earned frequency during setup (it was acquired
+        // and then evicted over the shrink). In the buggy frozen state this entry would be
+        // unconditionally evicted because `probation` is empty; with the fix, `pop` compares
+        // frequencies and the high-frequency re-inserted entry survives.
+        let total = lfu.window_weight + lfu.probation_weight + lfu.protected_weight;
+        lfu.push(rs[0].clone());
+        // The insert overflows capacity by one, so the resize path evicts once (`evict(target)`).
+        assert_eq!(
+            lfu.window_weight + lfu.probation_weight + lfu.protected_weight,
+            total + 1
+        );
+        lfu.pop().unwrap();
+        // The re-inserted hot entry must have been admitted, not evicted.
+        let window = &lfu.dump()[0];
+        assert!(
+            window.iter().any(|r| Arc::as_ptr(r) == Arc::as_ptr(&rs[0])),
+            "hot re-inserted entry must be admitted after shrink, not immediately evicted (frozen-cache bug)"
+        );
+    }
+
+    /// `update` with a larger capacity (grow) must not move any records: the per-queue weights only
+    /// grow further below the enlarged budgets, so the rebalance loops are no-ops. This guards
+    /// against an off-by-one that would spuriously demote entries on grow.
+    #[test]
+    fn test_lfu_update_grow_is_noop() {
+        let config = LfuConfig {
+            window_capacity_ratio: 0.2,
+            protected_capacity_ratio: 0.6,
+            cmsketch_eps: 0.01,
+            cmsketch_confidence: 0.95,
+        };
+        let mut lfu = TestLfu::new(100, &config);
+        assert_eq!(lfu.window_weight_capacity, 20);
+        assert_eq!(lfu.protected_weight_capacity, 60);
+
+        let rs = (0..100)
+            .map(|i| {
+                Arc::new(Record::new(Data {
+                    key: i,
+                    value: i,
+                    properties: TestProperties::default(),
+                    hash: i,
+                    weight: 1,
+                }))
+            })
+            .collect_vec();
+        (0..100).for_each(|i| lfu.push(rs[i].clone()));
+        (0..80).for_each(|i| lfu.acquire_mutable(&rs[i]));
+        // Steady state.
+        let (w, p, pr) = (lfu.window_weight, lfu.probation_weight, lfu.protected_weight);
+        assert_eq!((w, p, pr), (20, 20, 60));
+
+        // Grow to 200: budgets enlarge to window=40, protected=120.
+        lfu.update(200, None).unwrap();
+        assert_eq!(lfu.window_weight_capacity, 40);
+        assert_eq!(lfu.protected_weight_capacity, 120);
+        // No records moved; total and per-queue weights unchanged.
+        assert_eq!(
+            (lfu.window_weight, lfu.probation_weight, lfu.protected_weight),
+            (w, p, pr)
+        );
+        assert_eq!(lfu.window_weight + lfu.probation_weight + lfu.protected_weight, 100);
+        // Invariants trivially hold under the larger budgets.
+        assert!(lfu.window_weight <= lfu.window_weight_capacity);
+        assert!(lfu.protected_weight <= lfu.protected_weight_capacity);
+    }
+
+    /// `update` to capacity 0 must drain `protected` and `window` into `probation` (rebalance), and
+    /// a subsequent `evict` to 0 empties the cache without panic. Mirrors the LRU
+    /// `test_lru_pin_resize_no_panic` shape for the LFU policy.
+    #[test]
+    fn test_lfu_update_to_zero() {
+        let config = LfuConfig {
+            window_capacity_ratio: 0.2,
+            protected_capacity_ratio: 0.6,
+            cmsketch_eps: 0.01,
+            cmsketch_confidence: 0.95,
+        };
+        let mut lfu = TestLfu::new(100, &config);
+
+        let rs = (0..50)
+            .map(|i| {
+                Arc::new(Record::new(Data {
+                    key: i,
+                    value: i,
+                    properties: TestProperties::default(),
+                    hash: i,
+                    weight: 1,
+                }))
+            })
+            .collect_vec();
+        (0..50).for_each(|i| lfu.push(rs[i].clone()));
+        (0..40).for_each(|i| lfu.acquire_mutable(&rs[i]));
+        assert!(lfu.protected_weight > 0);
+        assert!(lfu.window_weight > 0);
+
+        // Shrink to 0: all entries demote into `probation` (window and protected budgets become 0),
+        // then eviction empties the cache.
+        lfu.update(0, None).unwrap();
+        assert_eq!(lfu.window_weight_capacity, 0);
+        assert_eq!(lfu.protected_weight_capacity, 0);
+        // Rebalance moved everything out of window/protected into probation.
+        assert_eq!(lfu.window_weight, 0);
+        assert_eq!(lfu.protected_weight, 0);
+        assert_eq!(lfu.probation_weight, 50);
+        lfu.clear();
+        assert_eq!(lfu.window_weight + lfu.probation_weight + lfu.protected_weight, 0);
+        assert_ptr_vec_vec_eq(lfu.dump(), vec![vec![], vec![], vec![]]);
+    }
+
+    /// `update` with a new config must apply the new ratios and rebalance against them. The config
+    /// also exercises the validation branch of `update`.
+    #[test]
+    fn test_lfu_update_with_new_config() {
+        let config = LfuConfig {
+            window_capacity_ratio: 0.2,
+            protected_capacity_ratio: 0.6,
+            cmsketch_eps: 0.01,
+            cmsketch_confidence: 0.95,
+        };
+        let mut lfu = TestLfu::new(100, &config);
+
+        let rs = (0..100)
+            .map(|i| {
+                Arc::new(Record::new(Data {
+                    key: i,
+                    value: i,
+                    properties: TestProperties::default(),
+                    hash: i,
+                    weight: 1,
+                }))
+            })
+            .collect_vec();
+        (0..100).for_each(|i| lfu.push(rs[i].clone()));
+        (0..80).for_each(|i| lfu.acquire_mutable(&rs[i]));
+        assert_eq!(lfu.protected_weight, 60);
+
+        // Shrink to 50 AND raise protected ratio so the protected budget grows on the shrink.
+        let new_config = LfuConfig {
+            window_capacity_ratio: 0.1,
+            protected_capacity_ratio: 0.7,
+            cmsketch_eps: 0.01,
+            cmsketch_confidence: 0.95,
+        };
+        lfu.update(50, Some(&new_config)).unwrap();
+        // window = 10% of 50 = 5, protected = 70% of 50 = 35.
+        assert_eq!(lfu.window_weight_capacity, 5);
+        assert_eq!(lfu.protected_weight_capacity, 35);
+        assert!(lfu.window_weight <= lfu.window_weight_capacity);
+        assert!(lfu.protected_weight <= lfu.protected_weight_capacity);
+        assert_eq!(lfu.window_weight + lfu.probation_weight + lfu.protected_weight, 100);
+
+        // Invalid config is rejected and the existing budget/invariants are left untouched.
+        let before_w_cap = lfu.window_weight_capacity;
+        let before_p_cap = lfu.protected_weight_capacity;
+        let bad = LfuConfig {
+            window_capacity_ratio: 0.5,
+            protected_capacity_ratio: 0.9,
+            cmsketch_eps: 0.01,
+            cmsketch_confidence: 0.95,
+        };
+        assert!(lfu.update(50, Some(&bad)).is_err());
+        assert_eq!(lfu.window_weight_capacity, before_w_cap);
+        assert_eq!(lfu.protected_weight_capacity, before_p_cap);
     }
 }

@@ -1334,4 +1334,73 @@ mod tests {
     async fn test_sieve_cache() {
         case(sieve()).await
     }
+
+    /// End-to-end regression test for the LFU shrink-freeze bug, exercised through the public
+    /// `Cache::resize` API (the user-facing entry point cited in the bug report) rather than the
+    /// `Lfu` internals.
+    ///
+    /// With a single shard the w-TinyLFU queue layout is deterministic and matches the
+    /// eviction-level reproduction in `eviction::lfu::tests::test_lfu_update_rebalance_on_shrink`:
+    /// after filling and accessing the cache reaches steady state `window=20, probation=20,
+    /// protected=60`. A `resize(50)` then runs `eviction.update(50, None)` + `evict(50)`.
+    ///
+    /// In the buggy state, `update` does not rebalance, so the eviction drains `window`+`probation`
+    /// completely (they total 40 ≤ the 50 evictions) and leaves an over-budget `protected=50` with
+    /// empty `window`/`probation` — the cache is frozen: every new insert's `pop` sees an empty
+    /// `probation` and unconditionally evicts the freshly-inserted `window` entry.
+    ///
+    /// This test re-inserts a key evicted by the shrink whose count-min sketch frequency (raised by
+    /// the re-`push`) exceeds the surviving `probation` entries, then inserts a second key. In the
+    /// fixed state `probation` is non-empty, `pop` performs a frequency comparison, and the
+    /// higher-frequency re-inserted key survives. In the frozen state the re-inserted key is
+    /// unconditionally evicted by the second insert.
+    #[tokio::test]
+    async fn test_lfu_cache_resize_admits_after_shrink() {
+        let cache: Cache<u64, u64> = CacheBuilder::new(100)
+            .with_shards(1)
+            .with_eviction_config(LfuConfig {
+                window_capacity_ratio: 0.2,
+                protected_capacity_ratio: 0.6,
+                cmsketch_eps: 0.01,
+                cmsketch_confidence: 0.95,
+            })
+            .build();
+
+        // Fill: pushes land in `window`; `window` overflows its LRU entries to `probation`.
+        for k in 0..100u64 {
+            let _ = cache.insert(k, k);
+        }
+        assert_eq!(cache.usage(), 100);
+
+        // Access keys 0..80 once: each promotes `probation` -> `protected` (with `protected` ->
+        // `probation` overflow), reaching the steady state window=20, probation=20, protected=60.
+        for k in 0..80u64 {
+            let _ = cache.get(&k);
+        }
+
+        // Shrink to half capacity via the public resize API.
+        cache.resize(50).unwrap();
+        assert_eq!(cache.usage(), 50);
+
+        // key 0 is a low-`probation` entry and is evicted by the shrink in both the buggy and fixed
+        // cases; its frequency persists in the count-min sketch.
+        assert!(
+            cache.get(&0).is_none(),
+            "key 0 should have been evicted by the shrink (precondition)"
+        );
+
+        // Re-insert the (now higher-frequency) key 0, then insert a second key. In the buggy frozen
+        // state the second insert's `pop` sees an empty `probation` and evicts key 0 from `window`
+        // unconditionally, so key 0 disappears. In the fixed state `pop` compares frequencies and the
+        // higher-frequency key 0 survives.
+        let _ = cache.insert(0, 0);
+        let _ = cache.insert(1, 1);
+
+        assert!(
+            cache.get(&0).is_some(),
+            "high-frequency re-inserted key must be admitted after shrink (LFU freeze bug)"
+        );
+        assert!(cache.get(&1).is_some());
+        assert_eq!(cache.usage(), 50);
+    }
 }
