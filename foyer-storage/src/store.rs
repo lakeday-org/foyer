@@ -824,6 +824,8 @@ mod tests {
         store.wait().await;
 
         // The dedicated runtime's eager worker threads must be alive while the store exists.
+        // Thread-name probing via /proc/self/task is Linux-only; skip on other platforms.
+        #[cfg(target_os = "linux")]
         assert!(
             count_threads_named("foyer-drop-rt") >= 2,
             "dedicated runtime worker threads should exist while store is alive"
