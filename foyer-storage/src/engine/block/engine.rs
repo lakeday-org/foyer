@@ -1264,31 +1264,30 @@ mod tests {
         store.wait().await;
         assert_eq!(store.load(memory.hash(&1)).await.unwrap().kv(), None);
 
-        // 3. Append (SLOTS_PER_PAGE - 1) more tombstones for keys without on-disk data
-        //    blocks so the most-recent tombstone moves onto page 1 (logical slot
-        //    SLOTS_PER_PAGE), leaving T_E on page 0. The log has 5 pages, so no wrap.
+        // 3. Append (SLOTS_PER_PAGE - 1) more tombstones for keys without on-disk data blocks so the most-recent
+        //    tombstone moves onto page 1 (logical slot SLOTS_PER_PAGE), leaving T_E on page 0. The log has 5 pages, so
+        //    no wrap.
         let extras = TombstoneLog::SLOTS_PER_PAGE - 1;
         for i in 100u64..100 + extras as u64 {
             store.delete(memory.hash(&i));
         }
         store.wait().await;
 
-        // 4. Close + reopen. The recovered tombstones still suppress E here under both
-        //    the buggy and fixed code (T_E is still on disk at this point).
+        // 4. Close + reopen. The recovered tombstones still suppress E here under both the buggy and fixed code (T_E is
+        //    still on disk at this point).
         store.close().await.unwrap();
         drop(store);
         let store = store_for_test_with_multipage_tombstone_log(dir.path()).await;
         assert_eq!(store.load(memory.hash(&1)).await.unwrap().kv(), None);
 
-        // 5. Append one more tombstone for an unrelated hash. Under the bug the writer
-        //    resumes at page 0 local slot 1 (T_E's slot) and silently overwrites T_E.
-        //    Under the fix it resumes on page 1 and T_E survives.
+        // 5. Append one more tombstone for an unrelated hash. Under the bug the writer resumes at page 0 local slot 1
+        //    (T_E's slot) and silently overwrites T_E. Under the fix it resumes on page 1 and T_E survives.
         store.delete(memory.hash(&9999u64));
         store.wait().await;
 
-        // 6. Close + reopen again. Under the bug T_E is gone, so E's still-on-disk data
-        //    block is re-indexed by recovery and `load` returns the stale deleted value
-        //    (a phantom entry). Under the fix T_E survives and `load` stays `None`.
+        // 6. Close + reopen again. Under the bug T_E is gone, so E's still-on-disk data block is re-indexed by recovery
+        //    and `load` returns the stale deleted value (a phantom entry). Under the fix T_E survives and `load` stays
+        //    `None`.
         store.close().await.unwrap();
         drop(store);
         let store = store_for_test_with_multipage_tombstone_log(dir.path()).await;
