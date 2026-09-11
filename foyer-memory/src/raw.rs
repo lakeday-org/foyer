@@ -311,9 +311,11 @@ where
         self.eviction.clear();
 
         let mut count = 0;
+        let mut total_weight = 0;
 
         for record in records {
             count += 1;
+            total_weight += record.weight();
             strict_assert!(!record.is_in_indexer());
             strict_assert!(!record.is_in_eviction());
 
@@ -321,9 +323,11 @@ where
         }
 
         self.entries = 0;
+        self.usage = 0;
         if count > 0 {
             self.metrics.memory_entries.decrease(count);
             self.metrics.memory_remove.increase(count);
+            self.metrics.memory_usage.decrease(total_weight as _);
         }
     }
 
@@ -1734,6 +1738,77 @@ mod tests {
         pieces.sort_by_key(|t| t.0);
         let expected = (0..fifo.capacity() as u64).map(|i| (i, i, i)).collect_vec();
         assert_eq!(pieces, expected);
+    }
+
+    fn assert_clear_resets_usage<E>(cache: &RawCache<E, ModHasher, HashTableIndexer<E>>)
+    where
+        E: Eviction<Key = u64, Value = u64, Properties = TestProperties>,
+    {
+        let capacity = cache.capacity();
+        for i in 0..capacity as u64 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.entries(), capacity);
+        assert_eq!(cache.usage(), capacity);
+
+        cache.clear();
+
+        assert_eq!(cache.entries(), 0);
+        assert_eq!(cache.usage(), 0);
+        for i in 0..capacity as u64 {
+            assert!(cache.get(&i).is_none());
+        }
+
+        let key = capacity as u64;
+        cache.insert(key, key);
+        assert_eq!(cache.entries(), 1);
+        assert_eq!(cache.usage(), 1);
+        assert_eq!(*cache.get(&key).unwrap(), key);
+
+        cache.clear();
+        assert_eq!(cache.entries(), 0);
+        assert_eq!(cache.usage(), 0);
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_clear_resets_usage_and_entries() {
+        assert_clear_resets_usage(&fifo_cache_for_test());
+        assert_clear_resets_usage(&s3fifo_cache_for_test());
+        assert_clear_resets_usage(&lru_cache_for_test());
+        assert_clear_resets_usage(&lfu_cache_for_test());
+        assert_clear_resets_usage(&sieve_cache_for_test());
+    }
+
+    #[test]
+    fn test_clear_resets_weighted_usage() {
+        let cache: RawCache<Fifo<Vec<u8>, Vec<u8>, TestProperties>, ModHasher, HashTableIndexer<_>> =
+            RawCache::new(RawCacheConfig {
+                capacity: 4 * 1024, // 4KB
+                shards: 1,
+                eviction_config: FifoConfig::default(),
+                hash_builder: Default::default(),
+                weighter: Arc::new(|k, v| k.len() + v.len()),
+                filter: Arc::new(|_, _| true),
+                event_listener: None,
+                metrics: Arc::new(Metrics::noop()),
+            });
+
+        let key = vec![b'k'; 1024]; // 1KB
+        let value = vec![b'v'; 1024]; // 1KB
+
+        cache.insert(key.clone(), value.clone());
+        assert_eq!(cache.entries(), 1);
+        assert_eq!(cache.usage(), 2 * 1024);
+
+        cache.clear();
+
+        assert_eq!(cache.entries(), 0);
+        assert_eq!(cache.usage(), 0);
+
+        cache.insert(key.clone(), value.clone());
+        assert_eq!(cache.entries(), 1);
+        assert_eq!(cache.usage(), 2 * 1024);
     }
 
     async fn assert_flush_if<E>(cache: RawCache<E, ModHasher, HashTableIndexer<E>>)
