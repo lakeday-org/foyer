@@ -530,6 +530,25 @@ where
     load_holder: Holder,
 }
 
+impl<K, V, P> Drop for BlockEngineInner<K, V, P>
+where
+    K: StorageKey,
+    V: StorageValue,
+    P: Properties,
+{
+    fn drop(&mut self) {
+        // Tear down the dedicated runtime, if any.
+        //
+        // The flusher/reclaimer workers are spawned *on* the dedicated `Spawner::Runtime` and each
+        // captures a clone of the spawner (`Arc<BackgroundShutdownRuntime>`). This forms a self-cycle
+        // — `Arc -> Runtime -> spawned task -> Spawner (Arc)` — that keeps the strong count at or
+        // above one forever, so the last-`Arc`-drop shutdown would never fire on its own. Forcing the
+        // shutdown here drops the spawned tasks (releasing their spawner clones) and lets the
+        // runtime be reclaimed when the store is dropped. For `Spawner::Handle` this is a no-op.
+        self._spawner.shutdown();
+    }
+}
+
 impl<K, V, P> Clone for BlockEngine<K, V, P>
 where
     K: StorageKey,
@@ -847,10 +866,10 @@ where
 #[cfg(test)]
 mod tests {
 
-    use std::{fs::File, path::Path};
+    use std::{fs::File, path::Path, time::Duration};
 
     use bytesize::ByteSize;
-    use foyer_common::hasher::ModHasher;
+    use foyer_common::{hasher::ModHasher, spawn::BackgroundShutdownRuntime};
     use foyer_memory::{Cache, CacheBuilder, CacheEntry, FifoConfig, TestProperties};
     use itertools::Itertools;
 
@@ -1402,5 +1421,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.inner.block_manager.blocks(), (1 + 2 + 4) * MB / (64 * KB));
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dedicated_runtime_released_on_engine_drop() {
+        // The block engine spawns its flusher/reclaimer workers on the dedicated `Spawner::Runtime`,
+        // and each worker captures a clone of the spawner (`Arc<BackgroundShutdownRuntime>`). This
+        // formed a self-cycle that prevented the runtime from ever being dropped. Dropping the engine
+        // must tear the dedicated runtime down so the `Arc<BackgroundShutdownRuntime>` is released.
+        let dir = tempfile::tempdir().unwrap();
+        let dedicated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("foyer-eng-rt")
+            .enable_all()
+            .build()
+            .unwrap();
+        let bsr: Arc<BackgroundShutdownRuntime> = Arc::new(dedicated.into());
+        let weak = Arc::downgrade(&bsr);
+        let spawner = Spawner::Runtime(bsr);
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let device = FsDeviceBuilder::new(dir.path())
+            .with_capacity(ByteSize::kib(256).as_u64() as _)
+            .build()
+            .unwrap();
+        let builder: BlockEngineConfig<u64, Vec<u8>, TestProperties> = BlockEngineConfig {
+            device,
+            block_size: 16 * 1024,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 2,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
+            enable_tombstone_log: false,
+            buffer_pool_size: 16 * 1024 * 1024,
+            blob_index_size: 4 * 1024,
+            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+        let engine = Box::new(builder)
+            .build(EngineBuildContext {
+                io_engine,
+                metrics: Arc::new(Metrics::noop()),
+                spawner,
+                recover_mode: RecoverMode::Strict,
+            })
+            .await
+            .unwrap();
+        // The flusher/reclaimer workers are spawned during `build()` and hold `Arc<BSR>` clones, but
+        // the only *external* strong ref is the one we moved into the engine.
+        assert!(
+            weak.upgrade().is_some(),
+            "runtime must be alive while the engine is alive"
+        );
+
+        drop(engine);
+
+        // Poll until the background runtime shutdown releases the last `Arc<BSR>` clone. Before the
+        // fix, this never happened and the runtime leaked permanently.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && weak.upgrade().is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "Arc<BackgroundShutdownRuntime> was not released after drop(engine) (dedicated runtime leaked)"
+        );
     }
 }

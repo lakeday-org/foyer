@@ -14,9 +14,8 @@
 
 use std::{
     fmt::Debug,
-    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use tokio::{
@@ -26,46 +25,73 @@ use tokio::{
 
 use crate::error::{Error, ErrorKind, Result};
 
-/// A wrapper around [`Runtime`] that shuts down the runtime in the background when dropped.
+/// A wrapper around a dedicated tokio [`Runtime`] that can shut the runtime down in the background.
 ///
-/// This is necessary because directly dropping a nested runtime is not allowed in a parent runtime.
-pub struct BackgroundShutdownRuntime(ManuallyDrop<Runtime>);
+/// The runtime is shared by [`Arc`], so dropping the *last* clone does **not** deterministically run
+/// the shutdown: tasks spawned on the runtime may keep a clone alive themselves (e.g. via a captured
+/// [`Spawner`]), forming a self-cycle that prevents the strong count from ever reaching zero. To
+/// break such a cycle, call [`BackgroundShutdownRuntime::shutdown`] explicitly; the wrapper also
+/// defers the shutdown to a background step when the last clone is eventually dropped.
+///
+/// This is necessary because directly dropping a nested runtime is not allowed in a parent runtime;
+/// [`BackgroundShutdownRuntime::shutdown`] (like [`Runtime::shutdown_background`]) may be called from
+/// within the runtime itself or a parent runtime.
+pub struct BackgroundShutdownRuntime {
+    runtime: Mutex<Option<Runtime>>,
+    handle: Handle,
+}
 
 impl Debug for BackgroundShutdownRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BackgroundShutdownRuntime").finish()
+        f.debug_struct("BackgroundShutdownRuntime").finish()
+    }
+}
+
+impl BackgroundShutdownRuntime {
+    /// Deterministically shut the dedicated runtime down in the background.
+    ///
+    /// This is idempotent: the first call initiates the shutdown and subsequent calls are no-ops.
+    ///
+    /// This may be called from within the runtime itself or from a parent runtime. After this
+    /// returns, the runtime is being torn down in the background: all spawned tasks are dropped
+    /// (releasing any [`Arc`] clones they captured) and the worker threads exit.
+    pub fn shutdown(&self) {
+        if let Some(runtime) = self.runtime.lock().unwrap().take() {
+            #[cfg(madsim)]
+            drop(runtime);
+            #[cfg(not(madsim))]
+            runtime.shutdown_background();
+        }
     }
 }
 
 impl Drop for BackgroundShutdownRuntime {
     fn drop(&mut self) {
-        // Safety: The runtime is only dropped once here.
-        let runtime = unsafe { ManuallyDrop::take(&mut self.0) };
-
-        #[cfg(madsim)]
-        drop(runtime);
-        #[cfg(not(madsim))]
-        runtime.shutdown_background();
+        self.shutdown();
     }
 }
 
 impl Deref for BackgroundShutdownRuntime {
-    type Target = Runtime;
+    type Target = Handle;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.handle
     }
 }
 
 impl DerefMut for BackgroundShutdownRuntime {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.handle
     }
 }
 
 impl From<Runtime> for BackgroundShutdownRuntime {
     fn from(runtime: Runtime) -> Self {
-        Self(ManuallyDrop::new(runtime))
+        let handle = runtime.handle().clone();
+        Self {
+            runtime: Mutex::new(Some(runtime)),
+            handle,
+        }
     }
 }
 
@@ -140,5 +166,23 @@ impl Spawner {
     /// Get the current spawner.
     pub fn current() -> Self {
         Spawner::Handle(Handle::current())
+    }
+
+    /// Deterministically shut down the dedicated runtime, if this is a [`Spawner::Runtime`].
+    ///
+    /// This breaks the self-cycle where tasks spawned on the dedicated runtime keep a clone of the
+    /// spawner (and thus the runtime) alive, preventing the runtime from ever being dropped. After
+    /// this call the runtime is torn down in the background; all spawned tasks are dropped,
+    /// releasing any spawner clones they captured.
+    ///
+    /// For [`Spawner::Handle`], there is no owned runtime to shut down (the handle references an
+    /// externally-owned runtime whose lifetime the caller controls), so this is a no-op.
+    ///
+    /// This is safe to call from within the runtime itself or a parent runtime, and is idempotent.
+    pub fn shutdown(&self) {
+        match self {
+            Spawner::Runtime(rt) => rt.shutdown(),
+            Spawner::Handle(_) => {}
+        }
     }
 }
