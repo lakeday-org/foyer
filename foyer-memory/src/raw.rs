@@ -21,7 +21,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
@@ -416,7 +416,7 @@ where
 {
     shards: Vec<RwLock<RawCacheShard<E, S, I>>>,
 
-    capacity: usize,
+    capacity: AtomicUsize,
 
     hash_builder: Arc<S>,
     weighter: Arc<dyn Weighter<E::Key, E::Value>>,
@@ -517,7 +517,7 @@ where
             pipe: Arc::new(NoopPipe::default()),
             inner: Arc::new(RawCacheInner {
                 shards,
-                capacity: config.capacity,
+                capacity: AtomicUsize::new(config.capacity),
                 hash_builder: Arc::new(config.hash_builder),
                 weighter: config.weighter,
                 filter: config.filter,
@@ -580,6 +580,9 @@ where
             }
             return Err(e);
         }
+
+        // All shards updated successfully; refresh the reported aggregate capacity.
+        self.inner.capacity.store(capacity, Ordering::Relaxed);
 
         Ok(())
     }
@@ -813,7 +816,7 @@ where
     }
 
     pub fn capacity(&self) -> usize {
-        self.inner.capacity
+        self.inner.capacity.load(Ordering::Relaxed)
     }
 
     pub fn usage(&self) -> usize {
@@ -1905,6 +1908,48 @@ mod tests {
     fn test_sieve_cache_resize() {
         let cache = sieve_cache_for_test();
         test_resize(&cache);
+    }
+
+    #[test]
+    fn test_resize_updates_capacity_report() {
+        let cache = fifo_cache_for_test();
+        assert_eq!(cache.capacity(), 256);
+        cache.insert(1, 1);
+        cache.resize(64).unwrap();
+        assert_eq!(
+            cache.capacity(),
+            64,
+            "capacity() should reflect new capacity after resize"
+        );
+        cache.resize(1024).unwrap();
+        assert_eq!(
+            cache.capacity(),
+            1024,
+            "capacity() should reflect new capacity after upsize"
+        );
+    }
+
+    #[test]
+    fn test_resize_capacity_report_for_all_eviction_policies() {
+        let fifo = fifo_cache_for_test();
+        fifo.resize(128).unwrap();
+        assert_eq!(fifo.capacity(), 128);
+
+        let s3fifo = s3fifo_cache_for_test();
+        s3fifo.resize(128).unwrap();
+        assert_eq!(s3fifo.capacity(), 128);
+
+        let lru = lru_cache_for_test();
+        lru.resize(128).unwrap();
+        assert_eq!(lru.capacity(), 128);
+
+        let lfu = lfu_cache_for_test();
+        lfu.resize(128).unwrap();
+        assert_eq!(lfu.capacity(), 128);
+
+        let sieve = sieve_cache_for_test();
+        sieve.resize(128).unwrap();
+        assert_eq!(sieve.capacity(), 128);
     }
 
     mod fuzzy {
