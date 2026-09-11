@@ -857,7 +857,7 @@ mod tests {
     use super::*;
     use crate::{
         PsyncIoEngineConfig, RejectAll,
-        engine::RecoverMode,
+        engine::{RecoverMode, block::reclaimer::Reinsertion},
         io::{
             device::{DeviceBuilder, combined::CombinedDeviceBuilder, fs::FsDeviceBuilder},
             engine::{IoEngine, IoEngineBuildContext, IoEngineConfig},
@@ -957,6 +957,56 @@ mod tests {
             admission_filter: StorageFilter::new(),
             reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
             enable_tombstone_log: true,
+            buffer_pool_size: 16 * 1024 * 1024,
+            blob_index_size: 4 * 1024,
+            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+        let builder = Box::new(builder);
+        builder
+            .build(EngineBuildContext {
+                io_engine,
+                metrics,
+                spawner,
+                recover_mode: RecoverMode::Strict,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// A store builder that allows configuring the flusher count and the
+    /// reinsertion filter for multi-flusher tests.
+    ///
+    /// Compared with [`store_for_test_with_reinsertion_filter`], a larger device
+    /// capacity is used so that `flushers + clean_block_threshold` comfortably
+    /// fits within the available blocks.
+    async fn store_for_test_with_flushers(
+        dir: impl AsRef<Path>,
+        flushers: usize,
+        reinsertion_filter: StorageFilter,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        let device = FsDeviceBuilder::new(dir)
+            .with_capacity(ByteSize::kib(256).as_u64() as usize)
+            .build()
+            .unwrap();
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let metrics = Arc::new(Metrics::noop());
+        let builder = BlockEngineConfig {
+            device,
+            block_size: 16 * 1024,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter,
+            enable_tombstone_log: false,
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
@@ -1402,5 +1452,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.inner.block_manager.blocks(), (1 + 2 + 4) * MB / (64 * KB));
+    }
+
+    /// Regression test for stale read-after-delete under multi-flusher reinsertion.
+    ///
+    /// Reproduces the race where a key is deleted (tombstone persisted and removed
+    /// from the in-memory indexer) while an in-flight reinsertion for the same
+    /// hash is still buffered on another flusher. With the fix, the in-memory
+    /// tombstone is retained as a deletion watermark, so the stale reinsertion is
+    /// rejected by the `Occupied`-branch sequence guard instead of being installed
+    /// into a `Vacant` slot.
+    ///
+    /// `hash(2) = 2`, so the tombstone is routed to `flushers[2 % 2] = flushers[0]`.
+    /// The stale reinsertion is submitted directly to `flushers[1]` to force the
+    /// cross-flusher ordering that the race relies on.
+    #[test_log::test(tokio::test)]
+    async fn test_resurrection_multi_flusher() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = cache_for_test();
+        let store = store_for_test_with_flushers(dir.path(), 2, StorageFilter::new().with_condition(RejectAll)).await;
+
+        // Insert the entry and wait for the flush, so the on-disk bytes exist.
+        let e2 = memory.insert(2, vec![2; 3 * KB]);
+        enqueue(&store, e2);
+        store.wait().await;
+        assert_eq!(
+            store.load(memory.hash(&2)).await.unwrap().kv().unwrap(),
+            (2, vec![2; 3 * KB])
+        );
+
+        // Read the on-disk entry data, the same way the Reclaimer does, to build a
+        // reinsertion slice that carries the stale (pre-delete) sequence.
+        let addr = store.inner.indexer.get(memory.hash(&2)).unwrap();
+        let block = store.inner.block_manager.block(addr.block);
+        let buf = IoSliceMut::new(bits::align_up(PAGE, addr.len as usize));
+        let (buf, res) = block.read(Box::new(buf), addr.offset as _).await;
+        res.unwrap();
+        let slice = buf
+            .try_into_io_slice_mut()
+            .unwrap()
+            .into_io_slice()
+            .slice(..bits::align_up(PAGE, addr.len as usize));
+
+        // Hold the flush: both flushers can still `recv` submissions, but neither
+        // can flush. This lets the reinsertion be buffered before the delete.
+        store.hold_flush();
+
+        // Submit the stale reinsertion to F_1. The recv-time guard
+        // (`indexer.get(hash).is_some()`) passes because the entry is still live.
+        store.inner.flushers[1].submit(Submission::Reinsertion {
+            reinsertion: Reinsertion {
+                hash: memory.hash(&2),
+                len: addr.len as usize,
+                sequence: addr.sequence,
+                slice,
+            },
+        });
+        // Let F_1 receive the reinsertion and buffer the slice.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Delete the entry: insert_tombstone(hash, S_new) + submit Tombstone to F_0.
+        store.delete(memory.hash(&2));
+
+        // Unhold: both flushers race to flush. F_0 flushes the tombstone (no block
+        // I/O) and calls remove_batch; F_1 flushes the block write and calls
+        // insert_batch. With the fix, the tombstone is retained, so insert_batch
+        // hits the Occupied branch and rejects the stale reinsertion.
+        store.unhold_flush();
+        store.wait().await;
+
+        let result = store.load(memory.hash(&2)).await.unwrap();
+        assert_eq!(
+            result.kv(),
+            None,
+            "deleted entry must not reappear, but was resurrected"
+        );
+
+        store.close().await.unwrap();
     }
 }
