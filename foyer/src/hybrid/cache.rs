@@ -506,7 +506,7 @@ where
     /// Disable tracing.
     #[cfg(feature = "tracing")]
     pub fn disable_tracing(&self) {
-        self.inner.tracing.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.tracing.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Return `true` if tracing is enabled.
@@ -1701,5 +1701,151 @@ mod tests {
 
         let eref = err.downcast_ref::<TestError>();
         assert_eq!(eref, Some(&e));
+    }
+
+    // --- Tracing runtime-toggle regression tests (feature = "tracing") ---
+    //
+    // These cover the `enable_tracing` / `disable_tracing` / `is_tracing_enabled`
+    // runtime toggle on `HybridCache`. The flag-level test (`..._flag_level`) is
+    // always meaningful when the `tracing` feature is on, because it asserts on the
+    // public accessor directly. The end-to-end test
+    // (`..._end_to_end_emits_no_spans`) exercises the full
+    // `root_span!` -> `Span::root` -> reporter export path. The end-to-end symptom
+    // is only observable when fastrace's `enable` feature is *also* turned on (the
+    // `tracing` feature of this crate deliberately does not enable `fastrace/enable`,
+    // see `foyer/Cargo.toml`). Without `fastrace/enable`, `Span::root(...)`
+    // collapses to `Span::noop()` regardless of the flag, so the end-to-end test
+    // self-detects that configuration and becomes a no-op rather than a false
+    // failure. Build the end-to-end path with:
+    //   cargo nextest run -p foyer -F tracing -F fastrace/enable \
+    //     hybrid::cache::tests::test_disable_tracing_end_to_end_emits_no_spans
+
+    /// Collects exported fastrace `SpanRecord`s for the tracing-regression tests.
+    #[cfg(feature = "tracing")]
+    struct SpanCollectingReporter {
+        spans: Arc<std::sync::Mutex<Vec<fastrace::collector::SpanRecord>>>,
+    }
+
+    #[cfg(feature = "tracing")]
+    impl fastrace::collector::Reporter for SpanCollectingReporter {
+        fn report(&mut self, spans: Vec<fastrace::collector::SpanRecord>) {
+            self.spans.lock().unwrap().extend(spans);
+        }
+    }
+
+    /// Directly asserts the public flag-level contract of the tracing toggle.
+    #[cfg(feature = "tracing")]
+    #[test_log::test(tokio::test)]
+    async fn test_disable_tracing_flag_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let hybrid = open(dir.path()).await;
+
+        // Tracing is off by default (`Inner::tracing` is initialized to `false`).
+        let default = hybrid.is_tracing_enabled();
+        assert!(!default, "tracing must be off by default");
+
+        // `enable_tracing()` flips the flag to on.
+        hybrid.enable_tracing();
+        assert!(
+            hybrid.is_tracing_enabled(),
+            "enable_tracing() must report tracing enabled"
+        );
+
+        // `disable_tracing()` must flip the flag back to off. On the buggy source
+        // this stored `true`, so the accessor continued to report `true`.
+        hybrid.disable_tracing();
+        assert!(
+            !hybrid.is_tracing_enabled(),
+            "disable_tracing() must report tracing disabled"
+        );
+
+        // Toggling back to enabled still works after a disable.
+        hybrid.enable_tracing();
+        assert!(hybrid.is_tracing_enabled());
+
+        hybrid.disable_tracing();
+        assert!(!hybrid.is_tracing_enabled());
+    }
+
+    /// Asserts that `disable_tracing()` suppresses exported spans end-to-end.
+    #[cfg(feature = "tracing")]
+    #[test_log::test(tokio::test)]
+    async fn test_disable_tracing_end_to_end_emits_no_spans() {
+        use std::time::Duration;
+
+        let captured: Arc<std::sync::Mutex<Vec<fastrace::collector::SpanRecord>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        fastrace::set_reporter(
+            SpanCollectingReporter {
+                spans: captured.clone(),
+            },
+            fastrace::collector::Config::default().report_interval(Duration::from_millis(1)),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let hybrid = open(dir.path()).await;
+
+        // Calibration: enable tracing and trace an insert. If `fastrace/enable` is
+        // off, `Span::root(..)` collapses to `Span::noop()` and no span is ever
+        // exported regardless of the flag, so the span-emission symptom is
+        // structurally invisible. In that configuration the end-to-end assertion is
+        // vacuous, so the test exits as a no-op rather than reporting a false
+        // failure from an inert reporter pipeline.
+        hybrid.enable_tracing();
+        hybrid.insert(1u64, vec![b'x'; 4 * KB]);
+        fastrace::flush();
+
+        let baseline = {
+            let guard = captured.lock().unwrap();
+            guard.iter().filter(|r| r.name.contains("insert")).count()
+        };
+        if baseline == 0 {
+            // `fastrace/enable` is not active; the span-emission path is inert.
+            // Reset to a harmless reporter and exit cleanly.
+            fastrace::set_reporter(
+                fastrace::collector::ConsoleReporter,
+                fastrace::collector::Config::default(),
+            );
+            return;
+        }
+
+        // The reporter pipeline is live (`fastrace/enable` is on). Disabling
+        // tracing must suppress span emission for subsequent traced operations.
+        hybrid.disable_tracing();
+        hybrid.insert(2u64, vec![b'y'; 4 * KB]);
+        fastrace::flush();
+
+        {
+            let guard = captured.lock().unwrap();
+            let disabled_insert_spans: Vec<&fastrace::collector::SpanRecord> =
+                guard.iter().filter(|r| r.name.contains("insert")).collect();
+            assert_eq!(
+                disabled_insert_spans.len(),
+                baseline,
+                "disable_tracing() should suppress insert spans end-to-end, but additional spans were exported: {disabled_insert_spans:?}"
+            );
+        }
+
+        // Positive control: re-enabling tracing must produce new exported insert
+        // spans, proving that the absence observed above is due to the toggle and
+        // not a reporter pipeline artifact.
+        hybrid.enable_tracing();
+        hybrid.insert(3u64, vec![b'z'; 4 * KB]);
+        fastrace::flush();
+
+        {
+            let guard = captured.lock().unwrap();
+            let enabled_insert_spans: Vec<&fastrace::collector::SpanRecord> =
+                guard.iter().filter(|r| r.name.contains("insert")).collect();
+            assert!(
+                enabled_insert_spans.len() > baseline,
+                "after enable_tracing(), new insert spans should be exported; got {enabled_insert_spans:?}"
+            );
+        }
+
+        fastrace::set_reporter(
+            fastrace::collector::ConsoleReporter,
+            fastrace::collector::Config::default(),
+        );
     }
 }
