@@ -359,7 +359,15 @@ impl BlockManager {
         self.inner.metrics.storage_block_engine_block_reclaiming.decrease(1);
         if let Some(waiter) = state.clean_block_waiters.pop() {
             self.inner.metrics.storage_block_engine_block_writing.increase(1);
-            let _ = waiter.send(block);
+            if waiter.send(block.clone()).is_err() {
+                // Waiter was cancelled; return the reclaimed block to the clean pool instead of
+                // leaking it out of the state machine.
+                self.inner.metrics.storage_block_engine_block_writing.decrease(1);
+                self.inner.metrics.storage_block_engine_block_clean.increase(1);
+                state.clean_blocks.push_back(block.id());
+            } else {
+                state.writing_blocks.insert(block.id());
+            }
         } else {
             self.inner.metrics.storage_block_engine_block_clean.increase(1);
             state.clean_blocks.push_back(block.id());
@@ -476,5 +484,258 @@ impl DerefMut for ReclaimingBlock {
 impl Drop for ReclaimingBlock {
     fn drop(&mut self) {
         self.block_manager.on_reclaim_finish(self.block.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use asyncband::oneshot;
+    use foyer_common::{metrics::Metrics, spawn::Spawner};
+    use futures_core::future::BoxFuture;
+    use futures_util::FutureExt;
+
+    use super::{Block, BlockManager, ReclaimingBlock};
+    use crate::{
+        DeviceBuilder, IoEngineConfig, NoopDeviceBuilder, NoopIoEngineConfig,
+        engine::block::{eviction::FifoPicker, reclaimer::ReclaimerTrait},
+        io::engine::IoEngineBuildContext,
+        test_utils::Holder,
+    };
+
+    const BLOCK_SIZE: usize = 4096;
+
+    /// A reclaimer that parks the reclaim task on a [`Holder`] until it is released, then drops the
+    /// [`ReclaimingBlock`] to fire `on_reclaim_finish`. This lets tests deterministically control
+    /// when `on_reclaim_finish` runs relative to setting up a cancelled `get_clean_block` waiter.
+    #[derive(Debug)]
+    struct HolderReclaimer {
+        holder: Holder,
+    }
+
+    impl HolderReclaimer {
+        fn new(holder: Holder) -> Self {
+            Self { holder }
+        }
+    }
+
+    impl ReclaimerTrait for HolderReclaimer {
+        fn reclaim(&self, block: ReclaimingBlock) -> BoxFuture<'static, ()> {
+            let holder = self.holder.clone();
+            async move {
+                holder.wait().await;
+                drop(block);
+            }
+            .boxed()
+        }
+    }
+
+    /// A reclaimer that must never run: it is only used with `reclaim_concurrency == 0`, so
+    /// `reclaim_if_needed` never triggers a reclaim and the tests can drive `on_reclaim_finish`
+    /// (or `evict`) deterministically without involving the runtime spawner.
+    #[derive(Debug)]
+    struct DummyReclaimer;
+
+    impl ReclaimerTrait for DummyReclaimer {
+        fn reclaim(&self, _block: ReclaimingBlock) -> BoxFuture<'static, ()> {
+            unreachable!("DummyReclaimer::reclaim must not be invoked when reclaim_concurrency == 0")
+        }
+    }
+
+    async fn block_manager_for_test(
+        nblocks: usize,
+        reclaim_concurrency: usize,
+        clean_block_threshold: usize,
+        reclaimer: Arc<dyn ReclaimerTrait>,
+    ) -> BlockManager {
+        let spawner = Spawner::current();
+        let io_engine = NoopIoEngineConfig
+            .boxed()
+            .build(IoEngineBuildContext {
+                spawner: spawner.clone(),
+            })
+            .await
+            .unwrap();
+        let device = NoopDeviceBuilder::new(BLOCK_SIZE * nblocks).build().unwrap();
+        BlockManager::open(
+            device,
+            io_engine,
+            BLOCK_SIZE,
+            vec![Box::<FifoPicker>::default()],
+            reclaimer,
+            reclaim_concurrency,
+            clean_block_threshold,
+            Arc::new(Metrics::noop()),
+            spawner,
+        )
+        .unwrap()
+    }
+
+    /// Number of block ids currently tracked across the four state sets.
+    fn tracked_block_count(bm: &BlockManager) -> usize {
+        let s = bm.inner.state.read().unwrap();
+        s.clean_blocks.len() + s.writing_blocks.len() + s.evictable_blocks.len() + s.reclaiming_blocks.len()
+    }
+
+    fn state_counts(bm: &BlockManager) -> [usize; 4] {
+        let s = bm.inner.state.read().unwrap();
+        [
+            s.clean_blocks.len(),
+            s.writing_blocks.len(),
+            s.evictable_blocks.len(),
+            s.reclaiming_blocks.len(),
+        ]
+    }
+
+    /// Evict a block from the evictable pool and move it straight into `reclaiming_blocks`, as
+    /// `reclaim_if_needed` does right before spawning the reclaimer. Returns the reclaiming block.
+    fn evict_to_reclaiming(bm: &BlockManager) -> Block {
+        let mut state = bm.inner.state.write().unwrap();
+        let block = bm.evict(&mut state).expect("evictable must be non-empty");
+        state.reclaiming_blocks.insert(block.id());
+        block
+    }
+
+    /// Push a cancelled `get_clean_block` waiter: a sender whose receiver is dropped immediately,
+    /// leaving an orphaned `oneshot::Sender` in `clean_block_waiters`.
+    fn push_cancelled_waiter(bm: &BlockManager) {
+        let (tx, rx) = oneshot::channel();
+        let mut state = bm.inner.state.write().unwrap();
+        state.clean_block_waiters.push(tx);
+        drop(rx);
+        drop(state);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_on_reclaim_finish_dead_waiter_returns_block_to_clean_pool() {
+        let reclaimer = Arc::new(DummyReclaimer) as Arc<dyn ReclaimerTrait>;
+        let bm = block_manager_for_test(1, 0, 1, reclaimer).await;
+        bm.init(&[]);
+        assert_eq!(bm.blocks(), 1);
+
+        let block = evict_to_reclaiming(&bm);
+        push_cancelled_waiter(&bm);
+
+        // Before the fix, the dead waiter's `send` returned `Err` and the block was dropped out of
+        // every state set, permanently leaking it from the block rotation.
+        bm.on_reclaim_finish(block);
+
+        let [clean, writing, evictable, reclaiming] = state_counts(&bm);
+        assert_eq!(clean, 1, "reclaimed block must return to the clean pool, not be leaked");
+        assert_eq!(writing, 0);
+        assert_eq!(evictable, 0);
+        assert_eq!(reclaiming, 0);
+        assert_eq!(tracked_block_count(&bm), 1, "block leaked out of all state sets");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_on_reclaim_finish_live_waiter_tracks_writing_block() {
+        let reclaimer = Arc::new(DummyReclaimer) as Arc<dyn ReclaimerTrait>;
+        let bm = block_manager_for_test(1, 0, 1, reclaimer).await;
+        bm.init(&[]);
+
+        let block = evict_to_reclaiming(&bm);
+
+        // Register a *live* waiter (receiver kept alive).
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut state = bm.inner.state.write().unwrap();
+            state.clean_block_waiters.push(tx);
+        }
+
+        bm.on_reclaim_finish(block);
+
+        // A block handed to a live waiter must be tracked in `writing_blocks`, matching the fast
+        // path of `get_clean_block`. The buggy waiter path incremented the writing metric but never
+        // inserted the id into `writing_blocks`.
+        {
+            let state = bm.inner.state.read().unwrap();
+            assert!(
+                state.writing_blocks.contains(&0),
+                "block handed to a live waiter must be tracked in writing_blocks, got writing={:?}",
+                state.writing_blocks.iter().collect::<Vec<_>>(),
+            );
+            assert!(state.clean_blocks.is_empty());
+            assert!(state.evictable_blocks.is_empty());
+            assert!(state.reclaiming_blocks.is_empty());
+        }
+
+        // The waiter must receive exactly the reclaimed block.
+        let received = rx.await.unwrap();
+        assert_eq!(received.id(), 0);
+
+        // With the block properly tracked, the writing -> evictable transition must succeed.
+        bm.on_writing_finish(bm.block(0).clone());
+        let [clean, writing, evictable, reclaiming] = state_counts(&bm);
+        assert_eq!(evictable, 1, "block must transition writing -> evictable");
+        assert_eq!(writing, 0);
+        assert_eq!(clean, 0);
+        assert_eq!(reclaiming, 0);
+    }
+
+    /// Faithfully reproduces the production trigger: a real runtime task parked on
+    /// `get_clean_block` is cancelled (as `try_join_all` cancels sibling per-block futures on an
+    /// I/O error), orphaning its sender. The subsequent reclaim must recover the block, not leak it.
+    #[test_log::test(tokio::test)]
+    async fn test_cancelled_runtime_get_clean_block_waiter_is_recovered_by_reclaim() {
+        let holder = Holder::default();
+        holder.hold();
+        let reclaimer = Arc::new(HolderReclaimer::new(holder.clone())) as Arc<dyn ReclaimerTrait>;
+        let bm = block_manager_for_test(2, 1, 1, reclaimer).await;
+        // clean = {0}, evictable = {1}.
+        bm.init(&[0]);
+
+        // Fast-path get_clean_block for block 0 triggers a real reclaim of block 1 (parks on holder).
+        let block0 = bm.get_clean_block().clone().now_or_never().expect("block 0 fast path");
+        assert_eq!(block0.id(), 0);
+
+        // Spawn a real task that awaits get_clean_block for the (now empty) clean pool, mirroring a
+        // flusher per-block future parked on its block handle.
+        let wait = bm.get_clean_block();
+        let jh = tokio::spawn(wait);
+
+        // Let the task poll get_clean_block once and park, registering a sender with a real runtime
+        // waker on clean_block_waiters.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            bm.inner.state.read().unwrap().clean_block_waiters.len(),
+            1,
+            "the parked get_clean_block must have registered a waiter",
+        );
+
+        // Cancel the awaiting task, exactly as a sibling I/O error cancels it via try_join_all.
+        let abort = jh.abort_handle();
+        abort.abort();
+        // Awaiting a cancelled JoinHandle resolves once the runtime has dropped the task future,
+        // which drops the Shared get_clean_block handle and its oneshot receiver.
+        let _ = jh.await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // The sender is now orphaned but still queued in clean_block_waiters.
+        assert_eq!(
+            bm.inner.state.read().unwrap().clean_block_waiters.len(),
+            1,
+            "cancelled waiter must leave its orphaned sender queued",
+        );
+
+        // Release the parked reclaimer; on_reclaim_finish must consume the orphan and recover block 1.
+        holder.unhold();
+        bm.wait_reclaim().await;
+
+        assert_eq!(
+            tracked_block_count(&bm),
+            bm.blocks(),
+            "reclaimed block leaked out of all state sets"
+        );
+        let state = bm.inner.state.read().unwrap();
+        assert!(
+            state.clean_blocks.contains(&1),
+            "reclaimed block 1 must return to the clean pool, not be leaked",
+        );
+        assert!(state.clean_block_waiters.is_empty());
     }
 }
