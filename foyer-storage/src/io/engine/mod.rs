@@ -198,4 +198,49 @@ mod tests {
             .unwrap();
         test_read_write(engine, device.as_ref()).await;
     }
+
+    #[cfg(not(madsim))]
+    #[test_log::test(tokio::test)]
+    async fn test_psync_io_engine_simulated_io_latency() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_latency_file");
+        let device = build_test_file_device(&path).unwrap();
+
+        let engine = PsyncIoEngineConfig::new()
+            .with_write_io_latency(std::time::Duration::from_millis(80)..std::time::Duration::from_millis(100))
+            .with_read_io_latency(std::time::Duration::from_millis(80)..std::time::Duration::from_millis(100))
+            .boxed()
+            .build(IoEngineBuildContext {
+                spawner: Spawner::current(),
+            })
+            .await
+            .unwrap();
+
+        let threshold = std::time::Duration::from_millis(60);
+
+        let mut b1 = Box::new(IoSliceMut::new(16 * KIB));
+        Fill::fill_slice(&mut b1[..], &mut rng());
+
+        let write_start = std::time::Instant::now();
+        let (b1, res) = engine.write(b1, device.partition(0).as_ref(), 0).await;
+        res.unwrap();
+        assert!(
+            write_start.elapsed() >= threshold,
+            "write must block for the configured write io latency, but only elapsed {:?}",
+            write_start.elapsed(),
+        );
+        let b1 = b1.try_into_io_slice_mut().unwrap();
+
+        let b2 = Box::new(IoSliceMut::new(16 * KIB));
+        let read_start = std::time::Instant::now();
+        let (b2, res) = engine.read(b2, device.partition(0).as_ref(), 0).await;
+        res.unwrap();
+        assert!(
+            read_start.elapsed() >= threshold,
+            "read must block for the configured read io latency, but only elapsed {:?}",
+            read_start.elapsed(),
+        );
+        let b2 = b2.try_into_io_slice_mut().unwrap();
+        assert_eq!(b1, b2);
+    }
 }

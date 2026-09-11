@@ -129,9 +129,9 @@ impl IoEngineConfig for PsyncIoEngineConfig {
             let engine = PsyncIoEngine {
                 spawner: ctx.spawner,
                 #[cfg(any(test, feature = "test_utils"))]
-                write_io_latency: None,
+                write_io_latency: self.write_io_latency,
                 #[cfg(any(test, feature = "test_utils"))]
-                read_io_latency: None,
+                read_io_latency: self.read_io_latency,
             };
             let engine: Arc<dyn IoEngine> = Arc::new(engine);
             Ok(engine)
