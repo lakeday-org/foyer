@@ -976,6 +976,52 @@ mod tests {
             .unwrap()
     }
 
+    /// Like `store_for_test_with_tombstone_log`, but with a 4 MiB + 64 KiB device so the
+    /// tombstone log spans 5 pages (1280 slots). The extra pages let the most-recent
+    /// tombstone leave page 0 after enough deletes, which is required to exercise the
+    /// cross-page resume path in `TombstoneLog::open`.
+    async fn store_for_test_with_multipage_tombstone_log(
+        dir: impl AsRef<Path>,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        let device = FsDeviceBuilder::new(dir)
+            .with_capacity(ByteSize::mib(4).as_u64() as usize + ByteSize::kib(64).as_u64() as usize)
+            .build()
+            .unwrap();
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let metrics = Arc::new(Metrics::noop());
+        let builder = BlockEngineConfig {
+            device,
+            block_size: 16 * 1024,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 1,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            admission_filter: StorageFilter::new(),
+            reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
+            enable_tombstone_log: true,
+            buffer_pool_size: 16 * 1024 * 1024,
+            blob_index_size: 4 * 1024,
+            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+        let builder = Box::new(builder);
+        builder
+            .build(EngineBuildContext {
+                io_engine,
+                metrics,
+                spawner,
+                recover_mode: RecoverMode::Strict,
+            })
+            .await
+            .unwrap()
+    }
+
     fn enqueue(
         store: &BlockEngine<u64, Vec<u8>, TestProperties>,
         entry: CacheEntry<u64, Vec<u8>, ModHasher, TestProperties>,
@@ -1192,6 +1238,67 @@ mod tests {
             store.load(memory.hash(&3)).await.unwrap().kv(),
             Some((3, vec![3; 3 * KB]))
         );
+    }
+
+    /// Regression test for the tombstone-log resume bug. After a reopen with the
+    /// most-recent tombstone on a non-zero page, the writer must resume at the *global*
+    /// slot and not overwrite an older, still-needed tombstone on page 0. Otherwise a
+    /// deleted key whose data block is still on disk reappears as a phantom `load`.
+    #[test_log::test(tokio::test)]
+    async fn test_store_tombstone_log_resume_no_phantom_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = store_for_test_with_multipage_tombstone_log(dir.path()).await;
+
+        // 1. Insert + flush entry E (key 1). Its data block is now persisted on disk.
+        let e = memory.insert(1, vec![1; 3 * KB]);
+        enqueue(&store, e);
+        store.wait().await;
+        assert_eq!(
+            store.load(memory.hash(&1)).await.unwrap().kv().unwrap(),
+            (1, vec![1; 3 * KB])
+        );
+
+        // 2. Delete E. Tombstone T_E is appended at tombstone-log slot 1 (page 0, local 1).
+        store.delete(memory.hash(&1));
+        store.wait().await;
+        assert_eq!(store.load(memory.hash(&1)).await.unwrap().kv(), None);
+
+        // 3. Append (SLOTS_PER_PAGE - 1) more tombstones for keys without on-disk data
+        //    blocks so the most-recent tombstone moves onto page 1 (logical slot
+        //    SLOTS_PER_PAGE), leaving T_E on page 0. The log has 5 pages, so no wrap.
+        let extras = TombstoneLog::SLOTS_PER_PAGE - 1;
+        for i in 100u64..100 + extras as u64 {
+            store.delete(memory.hash(&i));
+        }
+        store.wait().await;
+
+        // 4. Close + reopen. The recovered tombstones still suppress E here under both
+        //    the buggy and fixed code (T_E is still on disk at this point).
+        store.close().await.unwrap();
+        drop(store);
+        let store = store_for_test_with_multipage_tombstone_log(dir.path()).await;
+        assert_eq!(store.load(memory.hash(&1)).await.unwrap().kv(), None);
+
+        // 5. Append one more tombstone for an unrelated hash. Under the bug the writer
+        //    resumes at page 0 local slot 1 (T_E's slot) and silently overwrites T_E.
+        //    Under the fix it resumes on page 1 and T_E survives.
+        store.delete(memory.hash(&9999u64));
+        store.wait().await;
+
+        // 6. Close + reopen again. Under the bug T_E is gone, so E's still-on-disk data
+        //    block is re-indexed by recovery and `load` returns the stale deleted value
+        //    (a phantom entry). Under the fix T_E survives and `load` stays `None`.
+        store.close().await.unwrap();
+        drop(store);
+        let store = store_for_test_with_multipage_tombstone_log(dir.path()).await;
+        assert_eq!(
+            store.load(memory.hash(&1)).await.unwrap().kv(),
+            None,
+            "deleted key must not resurface as a phantom entry after tombstone-log reopen"
+        );
+
+        store.close().await.unwrap();
     }
 
     // FIXME(MrCroxx): Move the admission test to store level.

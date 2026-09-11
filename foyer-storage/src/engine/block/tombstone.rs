@@ -69,6 +69,15 @@ impl TombstoneLog {
     ) -> Result<Self> {
         let mut recovered = vec![];
 
+        // `addr` records the *global* byte offset of the most-recent tombstone seen so
+        // far. It must accumulate across all partitions and pages (not reset per page),
+        // otherwise `latest_tombstone_page` below always collapses to `0` and the
+        // writer resumes on page 0 instead of right after the last global slot,
+        // silently overwriting older tombstones that may still be needed.
+        let mut seq = 0;
+        let mut addr = 0;
+        let mut global_addr = 0usize;
+
         for partition in partitions.iter() {
             for offset in (0..partition.size()).step_by(PAGE) {
                 tracing::trace!(offset, "[tombstone log]: recover at");
@@ -76,19 +85,18 @@ impl TombstoneLog {
                 let (buffer, res) = io_engine.read(Box::new(buf), partition.as_ref(), offset as u64).await;
                 res?;
 
-                let mut seq = 0;
-                let mut addr = 0;
-
-                for (slot, buf) in buffer.chunks_exact(Tombstone::SERIALIZED_LEN).enumerate() {
+                for buf in buffer.chunks_exact(Tombstone::SERIALIZED_LEN) {
                     let tombstone = Tombstone::read(buf);
-                    if tombstone.sequence > seq {
-                        seq = tombstone.sequence;
-                        addr = slot * Tombstone::SERIALIZED_LEN;
-                    }
                     if tombstone.sequence == 0 {
+                        global_addr += Tombstone::SERIALIZED_LEN;
                         continue;
                     }
+                    if tombstone.sequence > seq {
+                        seq = tombstone.sequence;
+                        addr = global_addr;
+                    }
                     recovered.push((tombstone, addr));
+                    global_addr += Tombstone::SERIALIZED_LEN;
                 }
             }
         }
@@ -310,6 +318,73 @@ mod tests {
             assert_eq!(inner.slot, (3 * 1024 + 42 + 1) % (TombstoneLog::SLOTS_PER_PAGE * 4));
             let (page, _) = log.slot_addr(inner.slot);
             assert_eq!(inner.buffer.page, page);
+        }
+    }
+
+    /// Regression test for the cross-page resume bug: after a ring wrap, the most-recent
+    /// tombstone lives on a non-zero page, so the writer must resume at its *global* slot
+    /// rather than its page-local slot. Under the bug, the resume slot always collapses to
+    /// a page-local value and the next append overwrites an older tombstone on page 0.
+    #[test_log::test(tokio::test)]
+    async fn test_tombstone_log_resume_after_wrap() {
+        let dir = tempdir().unwrap();
+
+        // 4 MB cache device => 16 KB tombstone log => 1K tombstones => 16K partition => 4 pages.
+        let device = FsDeviceBuilder::new(dir.path())
+            .with_capacity(4 * 1024 * 1024 + 16 * 1024)
+            .build()
+            .unwrap();
+        let p0 = device.create_partition(8 * 1024).unwrap();
+        let p1 = device.create_partition(8 * 1024).unwrap();
+        let io_engine = PsyncIoEngineConfig::new()
+            .boxed()
+            .build(IoEngineBuildContext {
+                spawner: Spawner::current(),
+            })
+            .await
+            .unwrap();
+
+        // 4 pages * 256 slots/page = 1024 slots in total.
+        let total_slots = TombstoneLog::SLOTS_PER_PAGE * 4;
+
+        let log = TombstoneLog::open(vec![p0.clone(), p1.clone()], io_engine.clone(), &mut vec![])
+            .await
+            .unwrap();
+
+        // Write enough tombstones to wrap the ring exactly once plus 266 more, so the
+        // most-recent tombstone lands on page 1 at local slot 10 (physical slot 266).
+        let written = total_slots + 266; // 1290
+        log.append(
+            (0..written)
+                .map(|i| Tombstone {
+                    hash: i as u64 + 1,
+                    sequence: i as u64 + 1,
+                })
+                .collect_vec()
+                .iter(),
+        )
+        .await
+        .unwrap();
+
+        drop(log);
+
+        let log = TombstoneLog::open(vec![p0.clone(), p1.clone()], io_engine.clone(), &mut vec![])
+            .await
+            .unwrap();
+
+        {
+            let inner = log.inner.lock().await;
+            // Resume must be the global slot right after the most-recent tombstone:
+            // (last physical slot 266) + 1 = 267. Under the bug this collapses to the
+            // page-local slot 10 + 1 = 11, i.e. page 0 instead of page 1.
+            let expected_slot = (written + 1) % total_slots; // 267
+            assert_eq!(
+                inner.slot, expected_slot,
+                "tombstone log must resume at the global slot after a ring wrap"
+            );
+            let (page, offset) = log.slot_addr(inner.slot);
+            assert_eq!(page, 1, "resume must land on page 1, not page 0, after wrap");
+            assert_eq!(offset, 11 * Tombstone::SERIALIZED_LEN);
         }
     }
 }
