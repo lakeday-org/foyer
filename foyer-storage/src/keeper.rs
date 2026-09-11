@@ -155,10 +155,74 @@ where
             let mut shard = shard.write();
             match shard.entry(self.hash(), |p| self.key() == p.key(), |p| p.hash()) {
                 HashTableEntry::Occupied(o) => {
-                    o.remove();
+                    if self.piece.ptr_eq(o.get()) {
+                        o.remove();
+                    }
                 }
                 HashTableEntry::Vacant(_) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use foyer_memory::{Cache, CacheBuilder, CacheProperties};
+
+    use super::*;
+
+    fn make() -> (Cache<u64, String>, Keeper<u64, String, CacheProperties>) {
+        let memory: Cache<u64, String> = CacheBuilder::new(16).build();
+        let keeper = Keeper::new(memory.shards());
+        (memory, keeper)
+    }
+
+    #[test]
+    fn test_keeper_reinsert_drop_removes_new_entry() {
+        let (memory, keeper) = make();
+
+        let e1 = memory.insert(1, "v1".to_string());
+        let e2 = memory.insert(1, "v2".to_string());
+
+        let hash = e1.hash();
+        assert_eq!(hash, e2.hash());
+
+        let p1 = e1.piece();
+        let p2 = e2.piece();
+
+        let r1 = keeper.insert(p1);
+        let r2 = keeper.insert(p2);
+
+        assert_eq!(keeper.get(hash, &1).unwrap().value(), "v2");
+
+        drop(r1);
+
+        let got = keeper.get(hash, &1);
+        assert!(got.is_some(), "keeper lost entry after dropping superseded piece ref");
+        assert_eq!(got.unwrap().value(), "v2");
+
+        drop(r2);
+
+        assert!(keeper.get(hash, &1).is_none());
+    }
+
+    #[test]
+    fn test_keeper_drop_current_then_superseded() {
+        let (memory, keeper) = make();
+
+        let e1 = memory.insert(1, "v1".to_string());
+        let e2 = memory.insert(1, "v2".to_string());
+        let hash = e1.hash();
+
+        let r1 = keeper.insert(e1.piece());
+        let r2 = keeper.insert(e2.piece());
+
+        assert_eq!(keeper.get(hash, &1).unwrap().value(), "v2");
+
+        drop(r2);
+        assert!(keeper.get(hash, &1).is_none());
+
+        drop(r1);
+        assert!(keeper.get(hash, &1).is_none());
     }
 }

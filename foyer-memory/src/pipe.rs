@@ -122,6 +122,18 @@ impl<K, V, P> Piece<K, V, P> {
         unsafe { &*self.properties }
     }
 
+    /// Returns `true` if this piece and `other` reference the same underlying record.
+    ///
+    /// Pieces created from the same [`Arc<Record>`] (including every clone
+    /// produced by [`Piece::clone`]) share the same record pointer and are
+    /// considered equal. Pieces created from distinct record allocations are
+    /// never equal, even if their key, value, and hash are all identical. This
+    /// is the identity relationship used to distinguish a still-live keeper
+    /// entry from a superseded one during `PieceRef` cleanup.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.record, other.record)
+    }
+
     pub(crate) fn into_record<E>(mut self) -> Arc<Record<E>>
     where
         E: Eviction<Key = K, Value = V, Properties = P>,
@@ -227,5 +239,40 @@ mod tests {
         drop(p2);
         drop(r1);
         drop(k1);
+    }
+
+    #[test]
+    fn test_piece_ptr_eq() {
+        let data = || Data::<Fifo<Arc<Vec<u8>>, Arc<Vec<u8>>, TestProperties>> {
+            key: Arc::new(vec![b'k'; 64]),
+            value: Arc::new(vec![b'v'; 64]),
+            properties: TestProperties::default(),
+            hash: 1,
+            weight: 1,
+        };
+
+        let r1 = Arc::new(Record::new(data()));
+        let r2 = Arc::new(Record::new(data()));
+
+        // Pieces derived from the same record allocation share the record pointer.
+        let p1 = Piece::new(r1.clone());
+        let p1_clone = p1.clone();
+        let p1_again = Piece::new(r1.clone());
+        assert!(p1.ptr_eq(&p1_clone));
+        assert!(p1_clone.ptr_eq(&p1));
+        assert!(p1.ptr_eq(&p1_again));
+        assert!(p1_again.ptr_eq(&p1_clone));
+
+        // A different record allocation yields a non-equal piece even though the
+        // key, value, and hash are identical.
+        let p2 = Piece::new(r2.clone());
+        assert!(!p1.ptr_eq(&p2));
+
+        drop(p1);
+        drop(p1_clone);
+        drop(p1_again);
+        drop(p2);
+        drop(r1);
+        drop(r2);
     }
 }
