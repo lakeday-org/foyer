@@ -716,4 +716,77 @@ mod tests {
         let l2 = store.load(&1).await.unwrap();
         assert!(matches!(l2, Load::Miss));
     }
+
+    #[tokio::test]
+    #[ignore = "requires FOYER_NOSPACE_DIR on a real ENOSPC-capable fs (e.g. tmpfs with nr_inodes=16)"]
+    async fn test_store_open_real_enospc_degrades() {
+        let dir = match std::env::var("FOYER_NOSPACE_DIR") {
+            Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+            _ => {
+                eprintln!("skip: FOYER_NOSPACE_DIR not set");
+                return;
+            }
+        };
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = entry.path();
+            if p.file_name()
+                .map(|n| {
+                    n.to_string_lossy().starts_with("foyer-storage-direct-fs-")
+                        || n.to_string_lossy().starts_with("__foyer_enospc_filler_")
+                })
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let mut filled = 0;
+        loop {
+            let p = dir.join(format!("__foyer_enospc_filler_{filled}"));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                Ok(_) => filled += 1,
+                Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => break,
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    let _ = std::fs::remove_file(&p);
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&p);
+                    panic!("unexpected filler error: {e}");
+                }
+            }
+        }
+        eprintln!("exhausted inodes after {filled} filler files");
+        let free_count = filled.min(8);
+        for i in 0..free_count {
+            let _ = std::fs::remove_file(dir.join(format!("__foyer_enospc_filler_{i}")));
+        }
+        eprintln!("freed {free_count} inodes for partition creation");
+
+        let metrics = Arc::new(Metrics::noop());
+        let memory: Cache<u64, Vec<u8>> = CacheBuilder::new(16).build();
+        let device = FsDeviceBuilder::new(&dir)
+            .with_capacity(64 * 1024 * 1024)
+            .build()
+            .unwrap();
+        let store = StoreBuilder::new("test", memory.clone(), metrics)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(BlockEngineConfig::new(device).with_block_size(16 * 1024))
+            .build()
+            .await
+            .expect("Store::open must degrade gracefully on real create-time ENOSPC, not abort");
+        eprintln!("Store opened (degraded). Inserting + loading...");
+
+        let e = memory.insert(1, b"hello".to_vec());
+        store.enqueue(e.piece(), false);
+        store.wait().await;
+        let l = store.load(&1).await.unwrap();
+        assert!(
+            matches!(l, Load::Entry { ref value, .. } if value == b"hello"),
+            "insert/load round-trip must succeed on the degraded-opened cache, got {l:?}"
+        );
+        eprintln!("insert/load round-trip OK");
+
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }

@@ -478,3 +478,165 @@ impl Drop for ReclaimingBlock {
         self.block_manager.on_reclaim_finish(self.block.clone());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use foyer_common::error::Error;
+
+    use super::*;
+    use crate::io::{
+        device::{Device, Partition, PartitionId, RawFile, statistics::Statistics, throttle::Throttle},
+        engine::{IoEngine, IoEngineBuildContext, IoEngineConfig, noop::NoopIoEngineConfig},
+    };
+
+    const BLOCK_SIZE: usize = 4 * 1024;
+
+    #[derive(Debug)]
+    struct QuotaPartition {
+        id: PartitionId,
+        size: usize,
+        statistics: Arc<Statistics>,
+    }
+
+    impl Partition for QuotaPartition {
+        fn id(&self) -> PartitionId {
+            self.id
+        }
+
+        fn size(&self) -> usize {
+            self.size
+        }
+
+        fn translate(&self, _: u64) -> (RawFile, u64) {
+            (RawFile(0 as _), 0)
+        }
+
+        fn statistics(&self) -> &Arc<Statistics> {
+            &self.statistics
+        }
+    }
+
+    #[derive(Debug)]
+    struct QuotaDevice {
+        capacity: usize,
+        limit: usize,
+        fail_with_io_error: bool,
+        partitions: RwLock<Vec<Arc<QuotaPartition>>>,
+        statistics: Arc<Statistics>,
+    }
+
+    impl QuotaDevice {
+        fn new(capacity: usize, limit: usize, fail_with_io_error: bool) -> Self {
+            Self {
+                capacity,
+                limit,
+                fail_with_io_error,
+                partitions: RwLock::new(vec![]),
+                statistics: Arc::new(Statistics::new(Throttle::default())),
+            }
+        }
+    }
+
+    impl Device for QuotaDevice {
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn allocated(&self) -> usize {
+            self.partitions.read().unwrap().iter().map(|p| p.size).sum()
+        }
+
+        fn create_partition(&self, size: usize) -> foyer_common::error::Result<Arc<dyn Partition>> {
+            let mut partitions = self.partitions.write().unwrap();
+            if partitions.len() >= self.limit {
+                let allocated: usize = partitions.iter().map(|p| p.size).sum();
+                if self.fail_with_io_error {
+                    return Err(Error::io_error(std::io::Error::other("simulated create io error")));
+                }
+                return Err(Error::no_space(self.capacity, allocated, allocated + size));
+            }
+            let id = partitions.len() as PartitionId;
+            let partition = Arc::new(QuotaPartition {
+                id,
+                size,
+                statistics: self.statistics.clone(),
+            });
+            partitions.push(partition.clone());
+            Ok(partition)
+        }
+
+        fn partitions(&self) -> usize {
+            self.partitions.read().unwrap().len()
+        }
+
+        fn partition(&self, id: PartitionId) -> Arc<dyn Partition> {
+            self.partitions.read().unwrap()[id as usize].clone()
+        }
+
+        fn statistics(&self) -> &Arc<Statistics> {
+            &self.statistics
+        }
+    }
+
+    #[derive(Debug)]
+    struct NopReclaimer;
+
+    impl ReclaimerTrait for NopReclaimer {
+        fn reclaim(&self, block: ReclaimingBlock) -> BoxFuture<'static, ()> {
+            async move {
+                let _ = block;
+            }
+            .boxed()
+        }
+    }
+
+    async fn io_engine_for_test(spawner: Spawner) -> Arc<dyn IoEngine> {
+        NoopIoEngineConfig
+            .boxed()
+            .build(IoEngineBuildContext { spawner })
+            .await
+            .unwrap()
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_block_manager_open_degrades_on_no_space() {
+        let device: Arc<dyn Device> = Arc::new(QuotaDevice::new(1024 * BLOCK_SIZE, 3, false));
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let metrics = Arc::new(Metrics::noop());
+        let bm = BlockManager::open(
+            device,
+            io_engine,
+            BLOCK_SIZE,
+            vec![],
+            Arc::new(NopReclaimer),
+            1,
+            1,
+            metrics,
+            spawner,
+        )
+        .expect("BlockManager::open must degrade gracefully on NoSpace instead of aborting");
+        assert_eq!(bm.blocks(), 3);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_block_manager_open_aborts_on_io_error() {
+        let device: Arc<dyn Device> = Arc::new(QuotaDevice::new(1024 * BLOCK_SIZE, 3, true));
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let metrics = Arc::new(Metrics::noop());
+        let err = BlockManager::open(
+            device,
+            io_engine,
+            BLOCK_SIZE,
+            vec![],
+            Arc::new(NopReclaimer),
+            1,
+            1,
+            metrics,
+            spawner,
+        )
+        .expect_err("BlockManager::open must propagate non-NoSpace io errors");
+        assert_eq!(err.kind(), ErrorKind::Io);
+    }
+}
