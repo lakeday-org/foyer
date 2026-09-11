@@ -227,12 +227,12 @@ where
 
     fn update(&mut self, capacity: usize, config: Option<&Self::Config>) -> Result<()> {
         if let Some(config) = config {
-            if config.small_queue_capacity_ratio > 0.0 && config.small_queue_capacity_ratio < 1.0 {
+            if config.small_queue_capacity_ratio <= 0.0 || config.small_queue_capacity_ratio >= 1.0 {
                 return Err(
                     Error::new(ErrorKind::Config, "update S3-FIFO config failed").with_context(
                         "reason",
                         format!(
-                            "small_queue_capacity_ratio must be in (0, 1), given: {}",
+                            "small_queue_capacity_ratio must be in (0, 1), given: {}, new configuration ignored",
                             config.small_queue_capacity_ratio
                         ),
                     ),
@@ -481,5 +481,84 @@ mod tests {
 
         s3fifo.clear();
         assert_ptr_vec_vec_eq(s3fifo.dump(), vec![vec![], vec![]]);
+    }
+
+    #[test]
+    fn test_s3fifo_update_with_valid_config() {
+        let config = S3FifoConfig {
+            small_queue_capacity_ratio: 0.25,
+            ghost_queue_capacity_ratio: 1.0,
+            small_to_main_freq_threshold: 2,
+        };
+        let mut s3fifo = TestS3Fifo::new(8, &config);
+        assert_eq!(s3fifo.small_weight_capacity, 2);
+        assert_eq!(s3fifo.ghost_queue.capacity, 8);
+
+        let new_config = S3FifoConfig {
+            small_queue_capacity_ratio: 0.5,
+            ghost_queue_capacity_ratio: 2.0,
+            small_to_main_freq_threshold: 3,
+        };
+        s3fifo.update(100, Some(&new_config)).unwrap();
+        assert_eq!(s3fifo.config.small_queue_capacity_ratio, 0.5);
+        assert_eq!(s3fifo.config.ghost_queue_capacity_ratio, 2.0);
+        assert_eq!(s3fifo.config.small_to_main_freq_threshold, 3);
+        assert_eq!(s3fifo.small_weight_capacity, 50);
+        assert_eq!(s3fifo.ghost_queue.capacity, 200);
+
+        let default_config = S3FifoConfig::default();
+        s3fifo.update(16, Some(&default_config)).unwrap();
+        assert_eq!(s3fifo.config.small_queue_capacity_ratio, 0.1);
+        assert_eq!(s3fifo.config.ghost_queue_capacity_ratio, 1.0);
+        assert_eq!(s3fifo.config.small_to_main_freq_threshold, 1);
+        assert_eq!(s3fifo.small_weight_capacity, (16.0_f64 * 0.1) as usize);
+        assert_eq!(s3fifo.ghost_queue.capacity, 16);
+
+        for ratio in [0.01_f64, 0.1, 0.25, 0.5, 0.9, 0.999] {
+            let cfg = S3FifoConfig {
+                small_queue_capacity_ratio: ratio,
+                ghost_queue_capacity_ratio: 1.0,
+                small_to_main_freq_threshold: 1,
+            };
+            s3fifo
+                .update(1000, Some(&cfg))
+                .unwrap_or_else(|_| panic!("valid ratio {ratio} should be accepted"));
+            assert_eq!(s3fifo.config.small_queue_capacity_ratio, ratio);
+            assert_eq!(s3fifo.small_weight_capacity, (1000.0_f64 * ratio) as usize);
+            assert_eq!(s3fifo.ghost_queue.capacity, 1000);
+        }
+    }
+
+    #[test]
+    fn test_s3fifo_update_with_invalid_config() {
+        let config = S3FifoConfig {
+            small_queue_capacity_ratio: 0.25,
+            ghost_queue_capacity_ratio: 1.0,
+            small_to_main_freq_threshold: 2,
+        };
+        let mut s3fifo = TestS3Fifo::new(8, &config);
+        assert_eq!(s3fifo.small_weight_capacity, 2);
+        assert_eq!(s3fifo.ghost_queue.capacity, 8);
+
+        for ratio in [0.0_f64, 1.0, -0.5, 2.0, f64::INFINITY, f64::NEG_INFINITY] {
+            let bad = S3FifoConfig {
+                small_queue_capacity_ratio: ratio,
+                ghost_queue_capacity_ratio: 1.0,
+                small_to_main_freq_threshold: 2,
+            };
+            let res = s3fifo.update(1000, Some(&bad));
+            let err = res.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Config, "ratio {ratio} should be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("small_queue_capacity_ratio must be in (0, 1)"),
+                "unexpected error message for ratio {ratio}: {msg}",
+            );
+            assert_eq!(s3fifo.config.small_queue_capacity_ratio, 0.25);
+            assert_eq!(s3fifo.config.ghost_queue_capacity_ratio, 1.0);
+            assert_eq!(s3fifo.config.small_to_main_freq_threshold, 2);
+            assert_eq!(s3fifo.small_weight_capacity, 2);
+            assert_eq!(s3fifo.ghost_queue.capacity, 8);
+        }
     }
 }
