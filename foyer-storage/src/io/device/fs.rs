@@ -127,6 +127,31 @@ impl FsDevice {
     }
 }
 
+fn is_no_space_io_error(source: &std::io::Error) -> bool {
+    matches!(
+        source.raw_os_error(),
+        Some(code) if code == libc::ENOSPC || is_disk_quota_exceeded(code)
+    )
+}
+
+#[cfg(unix)]
+fn is_disk_quota_exceeded(code: i32) -> bool {
+    code == libc::EDQUOT
+}
+
+#[cfg(not(unix))]
+fn is_disk_quota_exceeded(_code: i32) -> bool {
+    false
+}
+
+fn map_no_space(source: std::io::Error, capacity: usize, allocated: usize, required: usize) -> Error {
+    if is_no_space_io_error(&source) {
+        Error::no_space(capacity, allocated, required)
+    } else {
+        Error::io_error(source)
+    }
+}
+
 impl Device for FsDevice {
     fn capacity(&self) -> usize {
         self.capacity
@@ -139,8 +164,9 @@ impl Device for FsDevice {
     fn create_partition(&self, size: usize) -> Result<Arc<dyn Partition>> {
         let mut partitions = self.partitions.write().unwrap();
         let allocated = partitions.iter().map(|p| p.size).sum::<usize>();
-        if allocated + size > self.capacity {
-            return Err(Error::no_space(self.capacity, allocated, allocated + size));
+        let required = allocated + size;
+        if required > self.capacity {
+            return Err(Error::no_space(self.capacity, allocated, required));
         }
         let id = partitions.len() as PartitionId;
         let path = self.dir.join(Self::filename(id));
@@ -151,8 +177,12 @@ impl Device for FsDevice {
             use std::os::unix::fs::OpenOptionsExt;
             opts.custom_flags(libc::O_DIRECT | libc::O_NOATIME);
         }
-        let file = opts.open(path).map_err(Error::io_error)?;
-        file.set_len(size as _).map_err(Error::io_error)?;
+        let capacity = self.capacity;
+        let file = opts
+            .open(path)
+            .map_err(|e| map_no_space(e, capacity, allocated, required))?;
+        file.set_len(size as _)
+            .map_err(|e| map_no_space(e, capacity, allocated, required))?;
 
         let partition = Arc::new(FsPartition {
             id,
@@ -212,5 +242,40 @@ impl Partition for FsPartition {
 
     fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use foyer_common::error::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn test_map_no_space_converts_enospc_to_nospace() {
+        let err = map_no_space(std::io::Error::from_raw_os_error(libc::ENOSPC), 100, 40, 60);
+        assert_eq!(err.kind(), ErrorKind::NoSpace);
+        let ctx = err.context();
+        assert_eq!(ctx.len(), 3);
+        assert_eq!(ctx[0].0, "capacity");
+        assert_eq!(ctx[0].1, "100");
+        assert_eq!(ctx[1].0, "allocated");
+        assert_eq!(ctx[1].1, "40");
+        assert_eq!(ctx[2].0, "required");
+        assert_eq!(ctx[2].1, "60");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_map_no_space_converts_edquot_to_nospace() {
+        let err = map_no_space(std::io::Error::from_raw_os_error(libc::EDQUOT), 200, 0, 50);
+        assert_eq!(err.kind(), ErrorKind::NoSpace);
+    }
+
+    #[test]
+    fn test_map_no_space_keeps_other_os_errors_as_io() {
+        let err = map_no_space(std::io::Error::from_raw_os_error(libc::ENOENT), 100, 0, 10);
+        assert_ne!(err.kind(), ErrorKind::NoSpace);
+        assert_eq!(err.kind(), ErrorKind::Io);
     }
 }
