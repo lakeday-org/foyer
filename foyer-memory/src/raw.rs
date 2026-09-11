@@ -536,43 +536,31 @@ where
             .map(|index| Self::shard_capacity_for(capacity, shards, index))
             .collect_vec();
 
-        let handles = shard_capacities
-            .into_iter()
-            .enumerate()
-            .map(|(i, shard_capacity)| {
-                let pipe = self.pipe.clone();
-                let inner = self.inner.clone();
-                std::thread::spawn(move || {
-                    let mut garbages = vec![];
-                    let res = inner.shards[i].write().with(|mut shard| {
-                        shard.eviction.update(shard_capacity, None).inspect(|_| {
-                            shard.capacity = shard_capacity;
-                            shard.evict(shard_capacity, &mut garbages)
-                        })
-                    });
-                    // Deallocate data out of the lock critical section.
-                    let piped = pipe.is_enabled();
-                    if inner.event_listener.is_some() || piped {
-                        for (event, record) in garbages {
-                            if let Some(listener) = inner.event_listener.as_ref() {
-                                listener.on_leave(event, record.key(), record.value())
-                            }
-                            if piped && event == Event::Evict {
-                                pipe.send(Piece::new(record));
-                            }
-                        }
-                    }
-                    res
+        let mut errs = vec![];
+        for (i, shard_capacity) in shard_capacities.into_iter().enumerate() {
+            let mut garbages = vec![];
+            let res = self.inner.shards[i].write().with(|mut shard| {
+                shard.eviction.update(shard_capacity, None).inspect(|_| {
+                    shard.capacity = shard_capacity;
+                    shard.evict(shard_capacity, &mut garbages)
                 })
-            })
-            .collect_vec();
-
-        let errs = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .filter(|res| res.is_err())
-            .map(|res| res.unwrap_err())
-            .collect_vec();
+            });
+            // Deallocate data out of the lock critical section.
+            let piped = self.pipe.is_enabled();
+            if self.inner.event_listener.is_some() || piped {
+                for (event, record) in garbages {
+                    if let Some(listener) = self.inner.event_listener.as_ref() {
+                        listener.on_leave(event, record.key(), record.value())
+                    }
+                    if piped && event == Event::Evict {
+                        self.pipe.send(Piece::new(record));
+                    }
+                }
+            }
+            if let Err(e) = res {
+                errs.push(e);
+            }
+        }
         if !errs.is_empty() {
             let mut e = Error::new(ErrorKind::Config, "resize raw cache failed");
             for err in errs {
