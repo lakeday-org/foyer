@@ -389,8 +389,14 @@ where
             tokio::select! {
                 biased;
                 IoTaskCtx { handle, waiters, init, io_slice, tombstone_infos, piece_refs } = self.next_io_task_finish() => {
-                    if let Some(handle) = handle {
-                        self.current_block_handle = handle;
+                    match handle {
+                        Some(handle) => self.current_block_handle = handle,
+                        None => {
+                            // The carried-over block was already finalized before the error was
+                            // observed; discard the stale handle and start a fresh block.
+                            self.current_block_handle = self.block_manager.get_clean_block();
+                            self.ctx.reset();
+                        }
                     }
                     self.handle_io_complete(piece_refs, waiters, tombstone_infos, init);
                     // `try_into_io_buffer` must return `Some(..)` here.
