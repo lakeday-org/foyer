@@ -668,17 +668,37 @@ where
 
             let (key, value) = {
                 let now = Instant::now();
-                let res = match EntryDeserializer::deserialize::<K, V>(
-                    &buf[EntryHeader::serialized_len()..],
-                    header.key_len as _,
-                    header.value_len as _,
-                    header.compression,
-                    Some(header.checksum),
-                ) {
+                let key_len = header.key_len as usize;
+                let value_len = header.value_len as usize;
+                let total = EntryHeader::serialized_len() + key_len + value_len;
+                let res = if buf.len() < total {
+                    Err(Error::new(ErrorKind::OutOfRange, "fail to deserialize entry")
+                        .with_context("valid", format!("{:?}", 0..buf.len()))
+                        .with_context("get", format!("{:?}", 0..total)))
+                } else {
+                    let get = EntryHeader::checksum(&buf[..total], key_len, value_len);
+                    if get != header.checksum {
+                        Err(Error::new(ErrorKind::ChecksumMismatch, "fail to deserialize entry")
+                            .with_context("expected", header.checksum)
+                            .with_context("get", get))
+                    } else {
+                        EntryDeserializer::deserialize::<K, V>(
+                            &buf[EntryHeader::serialized_len()..],
+                            key_len,
+                            value_len,
+                            header.compression,
+                        )
+                    }
+                };
+                let res = match res {
                     Ok(res) => res,
                     Err(e) => {
                         return match e.kind() {
-                            ErrorKind::MagicMismatch | ErrorKind::ChecksumMismatch | ErrorKind::OutOfRange => {
+                            ErrorKind::MagicMismatch
+                            | ErrorKind::ChecksumMismatch
+                            | ErrorKind::OutOfRange
+                            | ErrorKind::Parse
+                            | ErrorKind::Io => {
                                 tracing::warn!(
                                     hash,
                                     ?addr,
@@ -887,12 +907,20 @@ mod tests {
 
     /// 4 files, fifo eviction, 16 KiB block, 64 KiB capacity.
     async fn engine_for_test(dir: impl AsRef<Path>) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
-        store_for_test_with_reinsertion_filter(dir, StorageFilter::new().with_condition(RejectAll)).await
+        engine_for_test_with_compression(dir, Compression::None).await
+    }
+
+    async fn engine_for_test_with_compression(
+        dir: impl AsRef<Path>,
+        compression: Compression,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        store_for_test_with_reinsertion_filter(dir, StorageFilter::new().with_condition(RejectAll), compression).await
     }
 
     async fn store_for_test_with_reinsertion_filter(
         dir: impl AsRef<Path>,
         reinsertion_filter: StorageFilter,
+        compression: Compression,
     ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
         let device = FsDeviceBuilder::new(dir)
             .with_capacity(ByteSize::kib(64).as_u64() as _)
@@ -904,7 +932,7 @@ mod tests {
         let builder = BlockEngineConfig {
             device,
             block_size: 16 * 1024,
-            compression: Compression::None,
+            compression,
             indexer_shards: 4,
             recover_concurrency: 2,
             flushers: 1,
@@ -1222,6 +1250,7 @@ mod tests {
         let store = store_for_test_with_reinsertion_filter(
             dir.path(),
             StorageFilter::new().with_condition(Biased::new(vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19])),
+            Compression::None,
         )
         .await;
 
@@ -1360,6 +1389,124 @@ mod tests {
         }
 
         assert!(store.load(memory.hash(&1)).await.unwrap().kv().is_none());
+    }
+
+    /// Flip the on-disk entry compression discriminant byte (the low byte of the
+    /// trailing magic word) of the first blob's first entry in any device file.
+    ///
+    /// The high 3 bytes of the magic word (`0x97 0x03 0x27`) are left untouched so
+    /// the corruption keeps passing the magic mask check — i.e. it simulates a
+    /// flip of the compression byte landing on another (possibly invalid) value
+    /// that evades the magic check, exactly the integrity gap from the bug report.
+    ///
+    /// The byte is located at its exact on-disk offset (blob index + entry header
+    /// magic field) and the header `key_len` prefix is verified, so a coincidental
+    /// `97 03 27 <comp>` byte pattern in the checksum/hash/payload cannot
+    /// misidentify the header.
+    fn flip_on_disk_compression_byte(dir: impl AsRef<Path>, expected: Compression, key_len: u32, mask: u8) -> usize {
+        const BLOB_INDEX_SIZE: usize = 4 * 1024;
+        let magic_off = BLOB_INDEX_SIZE + EntryHeader::MAGIC_FIELD_OFFSET;
+        let comp_off = magic_off + 3;
+        let header_off = magic_off - EntryHeader::MAGIC_FIELD_OFFSET;
+        let magic = [0x97u8, 0x03, 0x27, expected.to_u8()];
+        let mut flipped = 0;
+        for entry in std::fs::read_dir(dir.as_ref()).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.metadata().unwrap().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let buf = std::fs::read(&path).unwrap();
+            if buf.len() < comp_off + 1 || buf[magic_off..magic_off + 4] != magic {
+                continue;
+            }
+            if buf[header_off..header_off + 4] != key_len.to_be_bytes() {
+                continue;
+            }
+            let new_byte = buf[comp_off] ^ mask;
+            #[cfg(target_family = "unix")]
+            {
+                use std::os::unix::fs::FileExt;
+                let file = File::options().write(true).open(&path).unwrap();
+                file.write_all_at(&[new_byte], comp_off as u64).unwrap();
+            }
+            #[cfg(target_family = "windows")]
+            {
+                use std::os::windows::fs::FileExt;
+                let file = File::options().write(true).open(&path).unwrap();
+                file.seek_write(&[new_byte], comp_off as u64).unwrap();
+            }
+            flipped += 1;
+        }
+        flipped
+    }
+
+    /// A valid-range flip None(0x00) -> Zstd(0x01) must degrade to a clean miss and
+    /// remove the entry from the index, rather than propagating a persistent Err.
+    #[test_log::test(tokio::test)]
+    async fn test_load_compression_flip_none_to_zstd_is_clean_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = engine_for_test(dir.path()).await;
+
+        // Constant-byte value so the on-disk payload never contains the magic word;
+        // the only `97 03 27 <comp>` in the data region is the entry header.
+        let e = memory.insert(1, vec![1u8; 7 * KB]);
+        let h = memory.hash(&1);
+        enqueue(&store, e);
+        store.wait().await;
+
+        assert_eq!(store.load(h).await.unwrap().kv().unwrap(), (1, vec![1u8; 7 * KB]));
+
+        assert_eq!(flip_on_disk_compression_byte(dir.path(), Compression::None, 8, 0x01), 1);
+
+        // Not a propagated error, and a clean miss.
+        assert!(store.load(h).await.is_ok());
+        assert!(store.load(h).await.unwrap().kv().is_none());
+        // The entry was removed from the index, so it keeps missing.
+        assert!(store.load(h).await.unwrap().kv().is_none());
+    }
+
+    /// A valid-range flip Zstd(0x01) -> None(0x00) on a length-prefixed (Vec) value
+    /// must degrade to a clean miss. Without the fix, the compressed frame bytes
+    /// would be fed to `Vec::decode`, misreading a gigantic length prefix and
+    /// aborting the process on `Vec::with_capacity`.
+    #[test_log::test(tokio::test)]
+    async fn test_load_compression_flip_zstd_to_none_is_clean_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = engine_for_test_with_compression(dir.path(), Compression::Zstd).await;
+
+        let e = memory.insert(2, vec![2u8; 7 * KB]);
+        let h = memory.hash(&2);
+        enqueue(&store, e);
+        store.wait().await;
+
+        assert_eq!(store.load(h).await.unwrap().kv().unwrap(), (2, vec![2u8; 7 * KB]));
+
+        assert_eq!(flip_on_disk_compression_byte(dir.path(), Compression::Zstd, 8, 0x01), 1);
+
+        assert!(store.load(h).await.is_ok());
+        assert!(store.load(h).await.unwrap().kv().is_none());
+    }
+
+    /// Compressed entries must continue to round-trip correctly under the new
+    /// (header + payload) checksum scope, so the integrity fix has no regression
+    /// on the happy path for any codec.
+    #[test_log::test(tokio::test)]
+    async fn test_compressed_roundtrip_zstd_and_lz4() {
+        for compression in [Compression::Zstd, Compression::Lz4] {
+            let dir = tempfile::tempdir().unwrap();
+            let memory = cache_for_test();
+            let store = engine_for_test_with_compression(dir.path(), compression).await;
+
+            let e = memory.insert(7, vec![7u8; 5 * KB]);
+            let h = memory.hash(&7);
+            enqueue(&store, e);
+            store.wait().await;
+
+            assert_eq!(store.load(h).await.unwrap().kv().unwrap(), (7, vec![7u8; 5 * KB]));
+        }
     }
 
     #[test_log::test(tokio::test)]
