@@ -218,19 +218,22 @@ impl Buffer {
                 return false;
             }
         };
-        let checksum = Checksummer::checksum64(
-            &buf[EntryHeader::serialized_len()
-                ..EntryHeader::serialized_len() + info.key_len as usize + info.value_len as usize],
-        );
+        // Write the header with a placeholder checksum so the integrity-protected
+        // bytes are in place, then compute the checksum over them and patch it in.
         let header = EntryHeader {
             key_len: info.key_len as _,
             value_len: info.value_len as _,
             hash,
             sequence,
-            checksum,
+            checksum: 0,
             compression,
         };
         header.write(&mut buf[..EntryHeader::serialized_len()]);
+        let total = EntryHeader::serialized_len() + info.key_len as usize + info.value_len as usize;
+        let checksum = EntryHeader::checksum(&buf[..total], info.key_len as _, info.value_len as _);
+        (&mut buf
+            [EntryHeader::CHECKSUM_FIELD_OFFSET..EntryHeader::CHECKSUM_FIELD_OFFSET + EntryHeader::CHECKSUM_FIELD_LEN])
+            .put_u64(checksum);
 
         self.metrics
             .storage_entry_serialize_duration

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, io::Write};
+use std::{fmt::Debug, hash::Hasher, io::Write};
 
 use foyer_common::{
     code::{StorageKey, StorageValue},
@@ -33,6 +33,17 @@ impl Checksummer {
     #[expect(unused)]
     pub fn checksum32(buf: &[u8]) -> u32 {
         XxHash32::oneshot(0, buf)
+    }
+
+    /// Compute the xxhash64 over the concatenation of the given chunks, as if they
+    /// were a single contiguous buffer. Used to hash byte ranges that cannot be
+    /// covered by one contiguous slice (e.g. when an embedded field must be elided).
+    pub fn checksum64_chunks(chunks: &[&[u8]]) -> u64 {
+        let mut hasher = XxHash64::default();
+        for &chunk in chunks {
+            hasher.write(chunk);
+        }
+        hasher.finish()
     }
 }
 
@@ -164,7 +175,6 @@ impl EntryDeserializer {
         ken_len: usize,
         value_len: usize,
         compression: Compression,
-        checksum: Option<u64>,
     ) -> Result<(K, V)>
     where
         K: StorageKey,
@@ -174,16 +184,6 @@ impl EntryDeserializer {
             return Err(Error::new(ErrorKind::OutOfRange, "fail to deserialize entry")
                 .with_context("valid", format!("{:?}", 0..buffer.len()))
                 .with_context("get", format!("{:?}", 0..value_len + ken_len)));
-        }
-
-        // calculate checksum if needed
-        if let Some(expected) = checksum {
-            let get = Checksummer::checksum64(&buffer[..value_len + ken_len]);
-            if expected != get {
-                return Err(Error::new(ErrorKind::ChecksumMismatch, "fail to deserialize entry")
-                    .with_context("expected", expected)
-                    .with_context("get", get));
-            }
         }
 
         // deserialize value
