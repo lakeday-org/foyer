@@ -198,9 +198,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::Throttle;
-
     use super::{Metric, Statistics};
+    use crate::Throttle;
 
     // === Metric: lossless quota preservation (the core bug) ===
 
@@ -346,6 +345,10 @@ mod tests {
     // `#[ignore]`d). Run explicitly via:
     //   cargo nextest run -p foyer-storage --run-ignored all -E "test(io::device::statistics::tests::test_e2e_)"
 
+    use foyer_common::{metrics::Metrics, spawn::Spawner};
+    use rand::{Fill, rng};
+    use tempfile::tempdir;
+
     use crate::io::{
         PAGE,
         bytes::IoSliceMut,
@@ -354,9 +357,6 @@ mod tests {
             IoEngine, IoEngineBuildContext, IoEngineConfig, monitor::MonitoredIoEngine, psync::PsyncIoEngineConfig,
         },
     };
-    use foyer_common::{metrics::Metrics, spawn::Spawner};
-    use rand::{Fill, rng};
-    use tempfile::tempdir;
 
     const E2E_MIB: usize = 1024 * 1024;
 
