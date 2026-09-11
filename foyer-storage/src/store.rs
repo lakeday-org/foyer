@@ -509,8 +509,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use foyer_common::hasher::ModHasher;
-    use foyer_memory::CacheBuilder;
+    use std::time::{Duration, Instant};
+
+    use foyer_common::{code::DefaultHasher, hasher::ModHasher, spawn::BackgroundShutdownRuntime};
+    use foyer_memory::{CacheBuilder, CacheProperties};
 
     use super::*;
     use crate::{
@@ -715,5 +717,199 @@ mod tests {
 
         let l2 = store.load(&1).await.unwrap();
         assert!(matches!(l2, Load::Miss));
+    }
+
+    // Regression tests for the dedicated-runtime leak. Dropping a `Store` built with a dedicated
+    // `Spawner::Runtime` must release the `Arc<BackgroundShutdownRuntime>` so the runtime is shut
+    // down in the background (worker threads exit). Before the fix, a self-cycle
+    // (`Arc<BSR> -> Runtime -> spawned task -> Spawner(Arc<BSR>)`) kept the strong count above zero
+    // forever, so `BackgroundShutdownRuntime::drop` / `shutdown_background()` never ran.
+
+    /// Count OS threads whose `comm` starts with `prefix`. Linux-only probe; returns 0 elsewhere.
+    #[cfg(not(madsim))]
+    fn count_threads_named(prefix: &str) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_dir("/proc/self/task")
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter_map(|e| std::fs::read_to_string(e.path().join("comm")).ok())
+                        .filter(|s| s.trim().starts_with(prefix))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = prefix;
+            0
+        }
+    }
+
+    /// Poll until the given weak ref can no longer be upgraded, or `timeout` elapses.
+    #[cfg(not(madsim))]
+    fn wait_until_weak_dropped(weak: &std::sync::Weak<BackgroundShutdownRuntime>, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if weak.upgrade().is_none() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        weak.upgrade().is_none()
+    }
+
+    /// Poll until no OS thread whose `comm` starts with `prefix` remains, or `timeout` elapses.
+    #[cfg(not(madsim))]
+    fn wait_until_threads_gone(prefix: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if count_threads_named(prefix) == 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        count_threads_named(prefix) == 0
+    }
+
+    /// Build a dedicated-runtime `Store` for the leak tests, returning the store and a weak ref to the
+    /// runtime. The only strong ref to the `Arc<BackgroundShutdownRuntime>` is moved into the store.
+    #[cfg(not(madsim))]
+    async fn build_dedicated_runtime_store(
+        temp: &tempfile::TempDir,
+        thread_name: &str,
+        memory: Cache<u64, Vec<u8>>,
+    ) -> (
+        Store<u64, Vec<u8>, DefaultHasher, CacheProperties>,
+        std::sync::Weak<BackgroundShutdownRuntime>,
+    ) {
+        let metrics = Arc::new(Metrics::noop());
+        let dedicated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name(thread_name)
+            .enable_all()
+            .build()
+            .unwrap();
+        let bsr: Arc<BackgroundShutdownRuntime> = Arc::new(dedicated.into());
+        let weak = Arc::downgrade(&bsr);
+        let store = StoreBuilder::new("test", memory, metrics)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(temp.path())
+                        .with_capacity(256 * 1024)
+                        .build()
+                        .unwrap(),
+                )
+                .with_flushers(2)
+                .with_reclaimers(1)
+                .with_block_size(16 * 1024),
+            )
+            .with_spawner(Spawner::Runtime(bsr))
+            .build()
+            .await
+            .unwrap();
+        (store, weak)
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dedicated_runtime_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory: Cache<u64, Vec<u8>> = CacheBuilder::new(16).build();
+        let (store, weak) = build_dedicated_runtime_store(&dir, "foyer-drop-rt", memory.clone()).await;
+
+        let e = memory.insert(1, b"v1".to_vec());
+        store.enqueue(e.piece(), false);
+        store.wait().await;
+
+        // The dedicated runtime's eager worker threads must be alive while the store exists.
+        // Thread-name probing via /proc/self/task is Linux-only; skip on other platforms.
+        #[cfg(target_os = "linux")]
+        assert!(
+            count_threads_named("foyer-drop-rt") >= 2,
+            "dedicated runtime worker threads should exist while store is alive"
+        );
+        assert!(weak.upgrade().is_some(), "runtime must be alive while store is alive");
+
+        drop(store);
+        drop(memory);
+
+        // After dropping the store (with no external strong ref to the runtime), the runtime must be
+        // torn down: the `Arc<BackgroundShutdownRuntime>` must reach zero and the worker threads must
+        // exit. Before the fix, `weak.upgrade()` stayed `Some` forever.
+        assert!(
+            wait_until_weak_dropped(&weak, Duration::from_secs(5)),
+            "Arc<BackgroundShutdownRuntime> was not released after drop(store) (dedicated runtime leaked)"
+        );
+        assert!(
+            wait_until_threads_gone("foyer-drop-rt", Duration::from_secs(5)),
+            "dedicated runtime worker threads should exit after drop(store)"
+        );
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dedicated_runtime_released_on_close_then_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory: Cache<u64, Vec<u8>> = CacheBuilder::new(16).build();
+        let (store, weak) = build_dedicated_runtime_store(&dir, "foyer-close-rt", memory.clone()).await;
+
+        let e = memory.insert(1, b"v1".to_vec());
+        store.enqueue(e.piece(), false);
+        store.wait().await;
+
+        store.close().await.unwrap();
+        assert!(
+            weak.upgrade().is_some(),
+            "runtime must stay alive while the store is alive, even after close()"
+        );
+
+        drop(store);
+        drop(memory);
+
+        assert!(
+            wait_until_weak_dropped(&weak, Duration::from_secs(5)),
+            "Arc<BackgroundShutdownRuntime> was not released after close()+drop() (dedicated runtime leaked)"
+        );
+        assert!(
+            wait_until_threads_gone("foyer-close-rt", Duration::from_secs(5)),
+            "dedicated runtime worker threads should exit after close()+drop()"
+        );
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dedicated_runtime_no_accumulation() {
+        const N: usize = 4;
+        let mut dirs = vec![];
+        let mut weaks = vec![];
+        let mut names = vec![];
+        for i in 0..N {
+            dirs.push(tempfile::tempdir().unwrap());
+            let name = format!("foyer-accum-rt-{i}");
+            names.push(name.clone());
+            let memory: Cache<u64, Vec<u8>> = CacheBuilder::new(16).build();
+            let (store, weak) = build_dedicated_runtime_store(&dirs[i], &name, memory.clone()).await;
+            let e = memory.insert(i as u64, vec![i as u8; 1024]);
+            store.enqueue(e.piece(), false);
+            store.wait().await;
+            drop(store);
+            drop(memory);
+            weaks.push(weak);
+        }
+        // Every dropped runtime must be fully torn down — no accumulation across caches. Before the
+        // fix, all `N` dropped runtimes stayed alive (one leaked runtime per cache), so the strong
+        // count and the per-runtime worker threads never went away.
+        for (i, weak) in weaks.iter().enumerate() {
+            assert!(
+                wait_until_weak_dropped(weak, Duration::from_secs(5)),
+                "Arc<BackgroundShutdownRuntime> for iteration {i} was not released; runtimes accumulate"
+            );
+            assert!(
+                wait_until_threads_gone(&names[i], Duration::from_secs(5)),
+                "dedicated runtime worker threads for iteration {i} should exit"
+            );
+        }
     }
 }
