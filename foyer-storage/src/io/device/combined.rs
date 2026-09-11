@@ -97,13 +97,7 @@ impl Device for CombinedDevice {
     }
 
     fn allocated(&self) -> usize {
-        let inner = self.inner.read().unwrap();
-        let allocated = inner.partitions.iter().take(inner.next).map(|p| p.size()).sum();
-        if inner.next < inner.partitions.len() {
-            allocated + self.devices[inner.next].allocated()
-        } else {
-            allocated
-        }
+        self.devices.iter().map(|d| d.allocated()).sum()
     }
 
     fn create_partition(&self, size: usize) -> Result<Arc<dyn Partition>> {
@@ -171,5 +165,172 @@ impl Partition for CombinedPartition {
 
     fn statistics(&self) -> &Arc<Statistics> {
         &self.statistics
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// A minimal in-memory device that mirrors the `FileDevice`/`FsDevice`
+    /// semantics: `allocated()` is the sum of partition sizes and
+    /// `create_partition` returns `NoSpace` iff `allocated + size > capacity`.
+    ///
+    /// This avoids filesystem access while faithfully exercising
+    /// `CombinedDevice` allocation accounting.
+    #[derive(Debug)]
+    struct MockDevice {
+        capacity: usize,
+        partitions: Mutex<Vec<Arc<MockPartition>>>,
+        statistics: Arc<Statistics>,
+    }
+
+    #[derive(Debug)]
+    struct MockPartition {
+        id: PartitionId,
+        size: usize,
+        statistics: Arc<Statistics>,
+    }
+
+    impl Partition for MockPartition {
+        fn id(&self) -> PartitionId {
+            self.id
+        }
+        fn size(&self) -> usize {
+            self.size
+        }
+        fn translate(&self, _address: u64) -> (RawFile, u64) {
+            (RawFile(0 as _), 0)
+        }
+        fn statistics(&self) -> &Arc<Statistics> {
+            &self.statistics
+        }
+    }
+
+    impl MockDevice {
+        fn new(capacity: usize) -> Arc<Self> {
+            Arc::new(MockDevice {
+                capacity,
+                partitions: Mutex::new(vec![]),
+                statistics: Arc::new(Statistics::new(Throttle::default())),
+            })
+        }
+    }
+
+    impl Device for MockDevice {
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+        fn allocated(&self) -> usize {
+            self.partitions.lock().unwrap().iter().map(|p| p.size).sum()
+        }
+        fn create_partition(&self, size: usize) -> Result<Arc<dyn Partition>> {
+            let mut partitions = self.partitions.lock().unwrap();
+            let allocated = partitions.iter().map(|p| p.size).sum::<usize>();
+            if allocated + size > self.capacity {
+                return Err(Error::no_space(self.capacity, allocated, allocated + size));
+            }
+            let id = partitions.len() as PartitionId;
+            let partition = Arc::new(MockPartition {
+                id,
+                size,
+                statistics: self.statistics.clone(),
+            });
+            partitions.push(partition.clone());
+            Ok(partition as Arc<dyn Partition>)
+        }
+        fn partitions(&self) -> usize {
+            self.partitions.lock().unwrap().len()
+        }
+        fn partition(&self, id: PartitionId) -> Arc<dyn Partition> {
+            self.partitions.lock().unwrap()[id as usize].clone() as Arc<dyn Partition>
+        }
+        fn statistics(&self) -> &Arc<Statistics> {
+            &self.statistics
+        }
+    }
+
+    // Direction 1: over-count → under-free → silent loss.
+    // One leading device with capacity < block_size (4 MiB < 16 MiB default).
+    #[test]
+    fn test_combined_device_one_leading_small_silent_loss() {
+        let block_size: usize = 16 * 1024 * 1024; // default per engine.rs
+
+        let device_a: Arc<dyn Device> = MockDevice::new(4 * 1024 * 1024); // 4 MiB, 4K-aligned, < block_size
+        let device_b: Arc<dyn Device> = MockDevice::new(48 * 1024 * 1024); // 48 MiB = 3 blocks
+        let device = CombinedDeviceBuilder::new()
+            .with_device(device_a)
+            .with_device(device_b)
+            .build()
+            .unwrap();
+
+        let mut count = 0;
+        loop {
+            if device.free() < block_size {
+                break;
+            }
+            match device.create_partition(block_size) {
+                Ok(_p) => count += 1,
+                Err(e) if e.kind() == ErrorKind::NoSpace => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert_eq!(count, 3, "should fit 3 blocks, only got {}", count);
+    }
+
+    // Direction 2: over-count, n ≥ 2 leading small devices → allocated() > capacity() → underflow.
+    #[test]
+    fn test_combined_device_two_leading_allocated_exceeds_capacity() {
+        let block_size: usize = 16 * 1024 * 1024;
+
+        let device_a: Arc<dyn Device> = MockDevice::new(4 * 1024 * 1024);
+        let device_b: Arc<dyn Device> = MockDevice::new(4 * 1024 * 1024);
+        let device_c: Arc<dyn Device> = MockDevice::new(48 * 1024 * 1024);
+        let device = CombinedDeviceBuilder::new()
+            .with_device(device_a)
+            .with_device(device_b)
+            .with_device(device_c)
+            .build()
+            .unwrap();
+
+        for _ in 0..3 {
+            device.create_partition(block_size).unwrap();
+        }
+
+        assert!(
+            device.allocated() <= device.capacity(),
+            "allocated ({}) exceeds capacity ({}) — free() would underflow",
+            device.allocated(),
+            device.capacity()
+        );
+    }
+
+    // Direction 3: under-count → over-free → masked by NoSpace.
+    // A device creates multiple partitions before NoSpace; take(inner.next) omits most of them.
+    #[test]
+    fn test_combined_device_multi_partition_under_count() {
+        let block_size: usize = 16 * 1024 * 1024;
+
+        let device_a: Arc<dyn Device> = MockDevice::new(3 * block_size); // 3 partitions before NoSpace
+        let device_b: Arc<dyn Device> = MockDevice::new(block_size); // 1 partition
+        let device = CombinedDeviceBuilder::new()
+            .with_device(device_a)
+            .with_device(device_b)
+            .build()
+            .unwrap();
+
+        for _ in 0..4 {
+            device.create_partition(block_size).unwrap();
+        }
+
+        assert_eq!(
+            device.allocated(),
+            4 * block_size,
+            "allocated() should be {} but reported {}",
+            4 * block_size,
+            device.allocated()
+        );
     }
 }
