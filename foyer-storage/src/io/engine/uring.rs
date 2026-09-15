@@ -46,11 +46,6 @@ pub struct UringIoEngineConfig {
     sqpoll_idle: u32,
     iopoll: bool,
     weight: f64,
-
-    #[cfg(any(test, feature = "test_utils"))]
-    write_io_latency: Option<std::ops::Range<std::time::Duration>>,
-    #[cfg(any(test, feature = "test_utils"))]
-    read_io_latency: Option<std::ops::Range<std::time::Duration>>,
 }
 
 impl Default for UringIoEngineConfig {
@@ -71,10 +66,6 @@ impl UringIoEngineConfig {
             sqpoll_idle: 10,
             iopoll: false,
             weight: 1.0,
-            #[cfg(any(test, feature = "test_utils"))]
-            write_io_latency: None,
-            #[cfg(any(test, feature = "test_utils"))]
-            read_io_latency: None,
         }
     }
 
@@ -159,20 +150,6 @@ impl UringIoEngineConfig {
     /// This flag is only meaningful when [`Self::with_sqpoll`] is enabled.
     pub fn with_sqpoll_idle(mut self, idle: u32) -> Self {
         self.sqpoll_idle = idle;
-        self
-    }
-
-    /// Set the simulated additional write I/O latency for testing purposes.
-    #[cfg(any(test, feature = "test_utils"))]
-    pub fn with_write_io_latency(mut self, latency: std::ops::Range<std::time::Duration>) -> Self {
-        self.write_io_latency = Some(latency);
-        self
-    }
-
-    /// Set the simulated additional read I/O latency for testing purposes.
-    #[cfg(any(test, feature = "test_utils"))]
-    pub fn with_read_io_latency(mut self, latency: std::ops::Range<std::time::Duration>) -> Self {
-        self.read_io_latency = Some(latency);
         self
     }
 }
