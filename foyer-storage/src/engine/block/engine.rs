@@ -1194,26 +1194,6 @@ mod tests {
         );
     }
 
-    // FIXME(MrCroxx): Move the admission test to store level.
-    // #[test_log::test(tokio::test)]
-    // async fn test_store_admission() {
-    //     let dir = tempfile::tempdir().unwrap();
-
-    //     let memory = cache_for_test();
-    //     let store = store_for_test_with_admission_picker(&memory, dir.path(),
-    // Arc::new(BiasedPicker::new([1]))).await;
-
-    //     let e1 = memory.insert(1, vec![1; 7 * KB]);
-    //     let e2 = memory.insert(2, vec![2; 7 * KB]);
-
-    //     assert!(enqueue(&store, e1.clone(),).await.unwrap());
-    //     assert!(!enqueue(&store, e2,).await.unwrap());
-
-    //     let r1 = store.load(&1).await.unwrap().unwrap();
-    //     assert_eq!(r1, (1, vec![1; 7 * KB]));
-    //     assert!(store.load(&2).await.unwrap().is_none());
-    // }
-
     #[test_log::test(tokio::test)]
     async fn test_store_reinsertion() {
         let dir = tempfile::tempdir().unwrap();
