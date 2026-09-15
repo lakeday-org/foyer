@@ -73,26 +73,6 @@ impl Raw {
         let cap = slice.len();
         Self { ptr, cap }
     }
-
-    /// Consume [`Raw`] and get the raw pointer and the capacity.
-    ///
-    /// # Safety
-    ///
-    /// [`Raw::from_raw_parts`] must be called later. Otherwise the buffer memory will leak.
-    pub fn into_raw_parts(self) -> (*mut u8, usize) {
-        let res = (self.ptr, self.cap);
-        std::mem::forget(self);
-        res
-    }
-
-    /// Construct [`Raw`] with the raw pointer and the capacity.
-    ///
-    /// # Safety
-    ///
-    /// The `ptr` and `cap` must be returned by [`Raw::into_raw_parts`].
-    pub unsafe fn from_raw_parts(ptr: *mut u8, cap: usize) -> Self {
-        Self { ptr, cap }
-    }
 }
 
 impl Clone for Raw {
